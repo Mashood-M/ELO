@@ -1,0 +1,17 @@
+{
+  "name": "elevates-discord-bot",
+  "version": "1.0.0",
+  "description": "ElevatesOS <-> Discord bridge bot: account linking, cluster member tracking, and moderation.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "deploy-commands": "node src/deploy-commands.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.116.0",
+    "canvas": "^3.2.3",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5"
+  }
+}
