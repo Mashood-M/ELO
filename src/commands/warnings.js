@@ -1,6 +1,6 @@
 const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const api = require('../lib/api');
-const { isLeadOrRep } = require('../lib/roleCheck');
+const { checkCommandPermission } = require('../lib/permissions');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -10,7 +10,7 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
   async execute(interaction) {
-    if (!(await isLeadOrRep(interaction))) return;
+    if (!(await checkCommandPermission(interaction, 'warnings'))) return;
 
     await interaction.deferReply({ ephemeral: true });
 
@@ -32,7 +32,7 @@ module.exports = {
     const embed = new EmbedBuilder()
       .setTitle(`Warnings for ${target.tag}`)
       .setDescription(description)
-      .setColor(0xfee75c);
+      .setColor(0xFEE75C);
 
     await interaction.editReply({ embeds: [embed] });
   },

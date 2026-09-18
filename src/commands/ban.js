@@ -1,6 +1,6 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const api = require('../lib/api');
-const { isCampusLead } = require('../lib/roleCheck');
+const { checkCommandPermission } = require('../lib/permissions');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -14,7 +14,7 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
 
   async execute(interaction) {
-    if (!(await isCampusLead(interaction))) return;
+    if (!(await checkCommandPermission(interaction, 'ban'))) return;
 
     await interaction.deferReply();
 
@@ -22,7 +22,6 @@ module.exports = {
     const reason = interaction.options.getString('reason') || 'No reason given';
     const deleteDays = interaction.options.getInteger('delete_days') || 0;
 
-    // Check if the bot itself has permission to ban
     if (!interaction.guild.members.me?.permissions.has(PermissionFlagsBits.BanMembers)) {
       await interaction.editReply({
         content: "I don't have the **Ban Members** permission in this server. Please grant it to my role in Server Settings > Roles.",
@@ -35,7 +34,7 @@ module.exports = {
       if (member) {
         if (!member.bannable) {
           await interaction.editReply({
-            content: `I cannot ban **${target.tag}**. Their highest role is equal to or higher than my role, or they are the server owner. Please drag my bot role higher in Server Settings > Roles.`,
+            content: `I cannot ban **${target.tag}**. Their highest role is equal to or higher than my role, or they are the server owner.`,
           });
           return;
         }
@@ -52,6 +51,12 @@ module.exports = {
     const modLog = interaction.guild.channels.cache.find((c) => c.name === 'mod-log');
     if (modLog) modLog.send(`🔨 **${target.tag}** banned by **${interaction.user.tag}**. Reason: ${reason}`);
 
-    api.logEvent(interaction.guild.id, target.id, 'ban', { reason, by: interaction.user.tag }).catch(() => {});
+    const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
+    api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'ban', {
+      targetId: target.id,
+      targetTag: target.tag,
+      reason,
+      by: interaction.user.tag,
+    }).catch(() => {});
   },
 };

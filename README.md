@@ -1,129 +1,129 @@
 # ElevatesOS Discord Bot
 
-Bridges ElevatesOS chapters with Discord: verified per-chapter membership,
-live cluster counts, event-based community clusters on the main server,
-and moderation tools for Campus Leads / Class Reps.
+Direct bridge between **ElevatesOS** and **Discord**: identity-based account linking (zero DMs), resilient role and chapter synchronization, self-serve chapter server provisioning, private cluster workspaces, and role-based permissions split across main and chapter servers.
 
-## Setup
+The bot communicates directly with Supabase via the service-role key (no intermediate API layer) and responds to database events using Supabase Realtime alongside a robust polling reconciliation engine.
 
-1. **Create the bot** in the [Discord Developer Portal](https://discord.com/developers/applications):
-   - New Application → Bot → copy the **Token** and **Client ID**.
-   - Under Bot → Privileged Gateway Intents, enable **Server Members Intent** and **Message Content Intent**.
-   - Under OAuth2 → URL Generator: scopes `bot` + `applications.commands`; permissions: Kick Members, Ban Members, Moderate Members, Manage Roles, Manage Nicknames, Manage Threads, Send Messages, Read Message History.
-   - *Note on Interactions:* The arcade verification flow utilizes Button and Modal interactions. These work over `GatewayIntentBits.Guilds` (already enabled) and do not require any additional intents.
+---
 
-2. **Install & configure:**
+## Key Architecture & Capabilities
+
+### 1. Identity-Based Account Linking (No DMs, Ever)
+- **Zero Direct Messages**: All account linking is initiated in public server channels (`#link-server` or `#welcome`) across every guild the bot serves (main and chapter servers alike).
+- **Public Embed & Button**: Features an arcade-themed embed explaining account benefits with a `🔗 Connect Account` button (`customId: "link_account_start"`).
+- **Private Modal Interaction**: Clicking the button opens a private Discord modal requesting the user's **Elevates OS User ID** (`elevates_id`, raw numeric digits, UUID, or registered email).
+- **4-Hour OTP Verification**: Generates a 6-digit OTP stored in `discord_verification_codes` with a 4-hour expiration tied to their `discord_user_id`. The user inputs this code directly on their ElevatesOS profile page via `verify_discord_otp`.
+- **Universal Identity Recognition**: Once verified, the Discord identity is recognized immediately across all guilds—no re-verification is ever required in any chapter server.
+- **Strict Chapter Enforcement**: A user's active chapter is derived directly from `profiles.chapter_id`. Chapter-specific permissions and cluster access follow this single source of truth.
+
+### 2. Role Synchronization Engine
+- **Supabase as the Source of Truth**: Detects additions, modifications, and removals in `user_roles`, `roles`, and `profiles`.
+- **Automatic State Recomputation**:
+  - Assigns chapter roles matching the OS roles schema (Campus Lead, Class Representative, Student Member, Faculty Coordinator, etc.). Roles are generated per chapter, not shared globally.
+  - Automatically updates the member's server nickname to match their OS `full_name`.
+  - Grants the verified member role (`ELEVATES • Member`) and revokes unverified (`elevates`) or guest roles.
+- **Handling Chapter Transitions**: If a member's chapter assignment changes in ElevatesOS, the bot automatically strips chapter roles from the previous chapter server and grants access in the new one.
+- **Resilient Sync Queue (`SyncQueue`)**:
+  - Changes are enqueued and rate-limited to avoid Discord API rate limits (HTTP 429).
+  - Automatically handles 429 backoff with dynamic exponential wait times based on Discord's `retry_after` headers.
+  - In-flight and pending task deduplication ensures smooth processing during bulk organizational changes (such as term transitions).
+
+### 3. Chapter Server Provisioning (`/chapter` & `/activate-chapter`)
+- **`/chapter` Command (Main Server)**:
+  - Usable by verified **Campus Leads** in the Main Server to provision a server for their assigned chapter.
+  - Verifies that the caller holds the `campus_lead` role in ElevatesOS and that the chapter has no existing server configured.
+  - Generates a 1-hour setup token (`chp_...`) and provides the Discord Server Template link and bot invite link.
+- **`/activate-chapter <token>` Command (New Chapter Server)**:
+  - Executed by the Campus Lead inside the new chapter server once the bot joins.
+  - Automatically maps the guild to the chapter in `guild_config`.
+  - Creates Discord roles matching every active role in the OS `roles` table.
+  - Grants the Campus Lead their role and equips the role with the **Administrator** permission within that chapter server only.
+  - Automatically sets up the `#link-server` portal with the `🔗 Connect Account` button.
+  - **Founders Oversight in Main Server**: Creates a dedicated channel under the `Chapter Management` category in the Main Server (`#chp-<chapter-slug>`), permissioned exclusively for Founders/HQ Admins. Logs activation and streams real-time chapter events (joins, leaves, moderation actions) to this channel.
+
+### 4. Permission Split by Server Type
+Permissions are enforced using an OS-driven permission matrix (`src/lib/permissions.js`), bypassing static role-name dependencies:
+
+| Role | Main Server Permissions | Chapter Server Permissions |
+|---|---|---|
+| **Founder / HQ Admin** | Full access (`*`) | Full access (`*`) oversight |
+| **Campus Lead** | `/chapter` | Full moderation: `/kick`, `/ban`, `/unban`, `/mute`, `/warn`, `/warnings`, `/unlink`, `/announce`, `/reply-as-bot` |
+| **Class Representative** | None | Moderation: `/kick`, `/mute`, `/warn`, `/warnings` (no ban/unban/unlink) |
+| **Student Member** | None | Member commands: `/cluster` |
+
+### 5. Private Chapter Clusters
+- Detects cluster entries in `clusters` and `cluster_members` scoped to a chapter.
+- Automatically creates a **Private Category** named after the cluster (denying `@everyone`), containing:
+  1. `#discussion-and-doubts`: Text channel for doubt clearing and community questions.
+  2. `#resources`: Curated resources, documentation, and references.
+  3. `#challenges-and-tasks`: Weekly milestones, challenges, and roadmaps.
+  4. `#projects`: Project collaboration and showcase threads.
+  5. `🔊 Live Sessions`: Voice room for live calls and workshops.
+- Automatically creates roles:
+  - `<Cluster Name> Member`: Grants viewing, messaging, file attachments, and voice access to the cluster category.
+  - `<Cluster Name> Host`: Granted if `cluster.leader_id` is set. Permissions are scoped strictly to the cluster's category (manage messages, pin messages, voice moderation; no server-wide kick/ban).
+- Continuous membership synchronization: adding or removing a student in the OS cluster automatically grants or revokes their member role; leader changes reassign the host role.
+
+### 6. Preserved Features
+- **`/cluster`**: Displays member count and directory of linked chapter members.
+- **`/create-cluster`**: Opens public discussion forum threads in the Main Server.
+- **Welcome Card Generation**: 800x300 canvas image generated and posted to `#general-chat` upon account verification.
+- **DM-to-Staff Forwarding**: Inquiries sent to the bot via DM are forwarded to `#bot-commands` in the Main Server.
+- **Unverified Member Nudges**: Alerts unverified members who post in public channels, directing them to `#link-server`.
+- **Admin Broadcasts**: `/announce` and `/reply-as-bot` with OS role-based permission checks.
+
+---
+
+## Installation & Setup
+
+1. **Clone repository & install dependencies:**
    ```bash
    npm install
-   cp .env.example .env
-   # fill in DISCORD_TOKEN, DISCORD_CLIENT_ID, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
    ```
 
-   **Environment Variables:**
-   - `DISCORD_TOKEN`: Bot token
-   - `DISCORD_CLIENT_ID`: Application client ID
-   - `SUPABASE_URL`: Supabase project URL
-   - `SUPABASE_SERVICE_ROLE_KEY`: Supabase service role secret
-   - `ROLE_FOUNDER`: Name of Founder role (default: `ELEVATES • Founder`)
-   - `ROLE_ADMIN`: Name of Admin role (default: `ELEVATES • Admin`)
-   - `ROLE_CAMPUS_LEAD`: Name of Campus Lead role (default: `Campus Lead`)
-   - `ROLE_CLASS_REP`: Name of Class Rep role (default: `Class Rep`)
-   - `ROLE_VERIFIED`: Name of Verified member role (default: `ELEVATES • Member`)
-   - `ROLE_UNVERIFIED`: Name of Unverified member role (default: `elevates`)
-   - `ROLE_GUEST`: Name of Guest role (default: `Guest`)
-   - `MAX_VERIFY_ATTEMPTS`: Max failed attempts before notifying Campus Lead (default: `3`)
+2. **Configure Environment (`.env`):**
+   ```bash
+   cp .env.example .env
+   ```
+   Provide:
+   - `DISCORD_TOKEN`: Discord Bot Token
+   - `DISCORD_CLIENT_ID`: Discord Application Client ID
+   - `SUPABASE_URL`: Supabase Project URL
+   - `SUPABASE_SERVICE_ROLE_KEY`: Supabase Service Role Secret
 
-3. **Database Migration:**
-   Apply the SQL migration in `supabase/migrations/20260916000000_discord_bot_tables.sql`
-   to your Supabase project (via Supabase CLI or SQL Editor in Dashboard).
+3. **Apply Database Migrations:**
+   Ensure migrations in `supabase/migrations/` are applied to your Supabase project:
+   - `20260916000000_discord_bot_tables.sql`
+   - `20260917000000_discord_verification_codes.sql`
+   - `20260918000000_restructure_sync_and_provisioning.sql`
 
-4. **Register slash commands:**
+4. **Register Slash Commands:**
    ```bash
    npm run deploy-commands
    ```
 
-5. **Run the bot:**
+5. **Start Bot:**
    ```bash
    npm start
    ```
 
-6. **Deploy for real use:** run this as a long-lived process on Railway or
-   Fly.io (not Vercel — Discord bots need a persistent connection, which
-   serverless functions don't provide).
-
-## Verification & Onboarding Flow
-
-When a user joins a chapter server:
-1. They are immediately assigned the **Unverified** role (`elevates`).
-2. The bot sends an arcade-themed (orange & white) welcome embed in DM (with fallback to `#verify-here`) with two interactive buttons:
-   - **`✅ Yes, I have an account`**: Opens a Discord Modal prompting for their **ElevatesOS User ID**.
-     - On valid submission: Swaps Unverified → **Verified Member**, syncs their chapter designation (Campus Lead or Class Rep), updates their server nickname, and sends an arcade-themed confirmation embed.
-     - On invalid submission: Returns an ephemeral error message with remaining attempts and a retry button. After maximum attempts are exceeded, flags the failure to `#mod-log` and alerts their Campus Lead.
-   - **`🆕 No, I'm new here`**: Removes Unverified and assigns the **Guest** role. Guests can view general community channels (`#general-chat`, `#introductions`, `#rules`, `#announcements`) but cannot view chapter-specific tasks, clusters, or events.
-3. Original prompt buttons are disabled after clicking to prevent duplicate submissions.
-
-## Supabase Database Integration
-
-The bot talks directly to Supabase using the service role key (bypassing RLS).
-See `src/lib/api.js` for implementation details.
-
-### Tables
-
-- `guild_config`: `guild_id` (text, PK), `guild_type` ('main' | 'chapter'), `chapter_id` (uuid, nullable, FK -> chapters.id), `created_at`
-- `discord_links`: `id` (uuid, PK), `discord_user_id` (text), `discord_username` (text), `os_user_id` (uuid, FK -> users.id), `guild_id` (text, FK -> guild_config.guild_id), `status` ('pending' | 'linked' | 'unlinked'), `linked_at` (timestamp), `unlinked_at` (timestamp, nullable)
-- `discord_events_log`: `id` (uuid, PK), `guild_id` (text), `discord_user_id` (text), `event_type` (text), `detail` (jsonb), `created_at` (timestamp)
-- `discord_warnings`: `id` (uuid, PK), `discord_user_id` (text), `guild_id` (text), `reason` (text), `issued_by` (text), `created_at` (timestamp)
-
-## Onboarding a new chapter server
-
-1. Create the server from the shared Discord **Server Template**.
-2. Ensure channel permissions for the **Guest** role:
-   - Deny `View Channel` on `CLUSTERS & TASKS` and `EVENTS` categories.
-   - Allow `View Channel` on `GENERAL` and `WELCOME` categories.
-3. Invite this bot with the OAuth2 link from setup step 1.
-4. Run `/setup-chapter chapter_id:<the chapter's ElevatesOS ID>`.
-5. Done — joins now trigger verification automatically.
-
-## Commands
-
-| Command | Server | Access |
-|---|---|---|
-| `/setup-chapter` | Chapter | Admin, Founder (one-time) |
-| `/cluster` | Chapter | Anyone |
-| `/kick` | Chapter | Founder, Campus Lead, Class Rep |
-| `/ban` / `/unban` | Chapter | Founder, Campus Lead |
-| `/mute` | Chapter | Founder, Campus Lead, Class Rep |
-| `/warn` / `/warnings` | Chapter | Founder, Campus Lead, Class Rep |
-| `/unlink` | Chapter | Founder, Campus Lead |
-| `/announce` | Any | Founder, Campus Lead, Admin |
-| `/reply-as-bot` | Any | Founder, Campus Lead, Admin |
-
-## Extended Features & Modular Flags
-
-The bot includes four modular features that can be independently toggled on or off via environment variables (in `.env` / `src/config.js`):
-
-### 1. Welcome Card (Image Generation)
-- **Flag**: `FEATURE_WELCOME_CARD` (default: `true`)
-- **Behavior**: When a member completes verification, the bot dynamically renders an arcade-style 800x300 PNG welcome card using `canvas`. It features the user's avatar, display name, and verified member badge, posting it directly to `#general-chat` alongside a congratulatory message.
-
-### 2. DM-to-Staff Forwarding
-- **Flag**: `FEATURE_DM_FORWARDING` (default: `true`)
-- **Channel Config**: `STAFF_DM_FORWARD_CHANNEL` (default: `bot-commands`)
-- **Behavior**: If a member sends a direct message to the bot outside of an active verification flow, the bot lets the user know their message has been forwarded and builds a rich embed (with avatar, tag, user ID, content, and attachments) delivered to the designated staff channel in the primary (`main`) server.
-
-### 3. Nudge Unverified Members
-- **Flag**: `FEATURE_UNVERIFIED_NUDGE` (default: `true`)
-- **Behavior**: When a member with the `Unverified` role attempts to chat in a chapter server, the bot replies with a polite nudge reminding them to verify via their DMs or by contacting a Campus Lead. A built-in in-memory rate-limiter prevents nudging the same member more than once every 10 minutes.
-
-### 4. Admin Broadcast Commands
-- **Flag**: `FEATURE_ADMIN_BROADCAST` (default: `true`)
-- **Commands**:
-  - `/announce channel:<#channel> message:<text>`: Broadcasts a plain bot message to any target channel in the server. Restricted to Campus Leads and Admins.
-  - `/reply-as-bot message_id:<ID> text:<text>`: Replies to any target message in the current channel as the bot. Restricted to Campus Leads and Admins.
-
 ---
 
-Full design rationale, schema, and rollout plan: see the attached PRD.
+## Slash Commands Reference
 
-
-# ELO
+| Command | Usage Context | Required OS Role | Description |
+|---|---|---|---|
+| `/chapter` | Main Server | Campus Lead | Generates setup token & template link to provision a chapter server |
+| `/activate-chapter <token>` | Chapter Server | Campus Lead / Admin | Activates and configures a newly created chapter server |
+| `/connect [id]` | Any Server | Any User | Connects Discord identity with ElevatesOS |
+| `/cluster` | Chapter Server | Any Member | Displays verified member roster for the chapter |
+| `/create-cluster` | Main Server | Staff / Lead | Starts an open community discussion thread in `#doubts-and-help` |
+| `/kick <member> [reason]` | Chapter Server | Campus Lead, Class Rep, Founder | Kicks a member from the server |
+| `/ban <member> [reason] [days]` | Chapter Server | Campus Lead, Founder | Bans a member from the server |
+| `/unban <user_id>` | Chapter Server | Campus Lead, Founder | Unbans a user by their Discord User ID |
+| `/mute <member> <duration> [reason]` | Chapter Server | Campus Lead, Class Rep, Founder | Times out a member (e.g. `10m`, `2h`, `1d`) |
+| `/warn <member> <reason>` | Chapter Server | Campus Lead, Class Rep, Founder | Logs an official moderation warning |
+| `/warnings <member>` | Chapter Server | Campus Lead, Class Rep, Founder | Views a member's warning history |
+| `/unlink <member>` | Chapter Server | Campus Lead, Founder | Force-unlinks an account from ElevatesOS |
+| `/announce <channel> <message>` | Chapter / Main | Campus Lead (chapter), Founder | Broadcasts an announcement |
+| `/reply-as-bot <msg_id> <text>` | Chapter / Main | Campus Lead (chapter), Founder | Replies to a channel message as the bot |

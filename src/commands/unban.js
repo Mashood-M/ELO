@@ -1,6 +1,6 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const api = require('../lib/api');
-const { isCampusLead } = require('../lib/roleCheck');
+const { checkCommandPermission } = require('../lib/permissions');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -10,7 +10,7 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
 
   async execute(interaction) {
-    if (!(await isCampusLead(interaction))) return;
+    if (!(await checkCommandPermission(interaction, 'unban'))) return;
 
     await interaction.deferReply();
 
@@ -35,6 +35,10 @@ module.exports = {
     const modLog = interaction.guild.channels.cache.find((c) => c.name === 'mod-log');
     if (modLog) modLog.send(`✅ **${userId}** unbanned by **${interaction.user.tag}**.`);
 
-    api.logEvent(interaction.guild.id, userId, 'unban', { by: interaction.user.tag }).catch(() => {});
+    const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
+    api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'unban', {
+      userId,
+      by: interaction.user.tag,
+    }).catch(() => {});
   },
 };

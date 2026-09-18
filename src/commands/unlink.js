@@ -1,17 +1,17 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const config = require('../config');
 const api = require('../lib/api');
-const { isCampusLead } = require('../lib/roleCheck');
+const { checkCommandPermission } = require('../lib/permissions');
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('unlink')
-    .setDescription('Force-unlink a member\'s ElevatesOS account from Discord.')
+    .setDescription("Force-unlink a member's ElevatesOS account from Discord.")
     .addUserOption((opt) => opt.setName('member').setDescription('Member to unlink').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   async execute(interaction) {
-    if (!(await isCampusLead(interaction))) return;
+    if (!(await checkCommandPermission(interaction, 'unlink'))) return;
 
     await interaction.deferReply();
 
@@ -22,19 +22,29 @@ module.exports = {
     }
 
     try {
-      await api.unlinkUser(target.id, interaction.guild.id, 'manual_unlink');
+      await api.unlinkIdentity(target.id, interaction.guild.id, `unlinked_by_${interaction.user.tag}`);
     } catch (err) {
       await interaction.editReply({ content: `Failed to unlink: ${err.message}` });
       return;
     }
 
-    const verifiedRole = interaction.guild.roles.cache.find((r) => r.name === config.roles.verified);
-    const unverifiedRole = interaction.guild.roles.cache.find((r) => r.name === config.roles.unverified);
+    const verifiedRole = interaction.guild.roles.cache.find(
+      (r) => r.name.toLowerCase() === (config.roles.verified || 'ELEVATES • Member').toLowerCase()
+    );
+    const unverifiedRole = interaction.guild.roles.cache.find(
+      (r) => r.name.toLowerCase() === (config.roles.unverified || 'elevates').toLowerCase()
+    );
+
     if (verifiedRole) await target.roles.remove(verifiedRole).catch(() => {});
     if (unverifiedRole) await target.roles.add(unverifiedRole).catch(() => {});
 
-    await interaction.editReply(`🔗 **${target.user.tag}** has been unlinked. They'll need to re-verify.`);
+    await interaction.editReply(`🔗 **${target.user.tag}** has been unlinked from ElevatesOS. They will need to re-link to regain chapter access.`);
 
-    api.logEvent(interaction.guild.id, target.id, 'unlink', { by: interaction.user.tag }).catch(() => {});
+    const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
+    api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'unlink', {
+      targetId: target.id,
+      targetTag: target.user.tag,
+      by: interaction.user.tag,
+    }).catch(() => {});
   },
 };

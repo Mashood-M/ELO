@@ -1,9 +1,11 @@
 const { Events } = require('discord.js');
+const accountLinking = require('../lib/accountLinking');
 const verifyFlow = require('../lib/verifyFlow');
 
 module.exports = {
   name: Events.InteractionCreate,
   async execute(interaction) {
+    // 1. Slash commands
     if (interaction.isChatInputCommand()) {
       const command = interaction.client.commands.get(interaction.commandName);
       if (!command) return;
@@ -24,9 +26,15 @@ module.exports = {
       return;
     }
 
-    // Handle button clicks for verification flow
+    // 2. Button interactions
     if (interaction.isButton()) {
       try {
+        if (interaction.customId === 'link_account_start') {
+          await accountLinking.handleLinkButton(interaction);
+          return;
+        }
+
+        // Backward compatibility for existing buttons
         await verifyFlow.handleButton(interaction);
       } catch (err) {
         console.error('Error handling button interaction:', err);
@@ -34,9 +42,15 @@ module.exports = {
       return;
     }
 
-    // Handle modal submissions for verification flow
+    // 3. Modal submissions
     if (interaction.isModalSubmit()) {
       try {
+        if (interaction.customId === 'link_account_modal') {
+          await accountLinking.handleLinkModalSubmit(interaction);
+          return;
+        }
+
+        // Backward compatibility for existing modals
         await verifyFlow.handleModalSubmit(interaction);
       } catch (err) {
         console.error('Error handling modal submission:', err);

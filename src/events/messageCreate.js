@@ -1,7 +1,6 @@
 const { Events, EmbedBuilder } = require('discord.js');
 const config = require('../config');
 const api = require('../lib/api');
-const verifySessions = require('../lib/verifySessions');
 
 // In-memory rate-limit map for unverified member nudges (userId -> timestamp)
 const unverifiedNudgeMap = new Map();
@@ -17,18 +16,14 @@ module.exports = {
   async execute(message) {
     if (message.author.bot) return;
 
-    // FEATURE 2: DM-to-staff forwarding
+    // FEATURE 2: DM-to-staff forwarding (no DMs are used for verification anymore)
     if (!message.guild) {
       if (!config.features?.dmForwarding) return;
-
-      // Only forward if the user does NOT have an active verification session
-      const activeSession = verifySessions.get(message.author.id);
-      if (activeSession) return;
 
       try {
         // Inform the user their message has been forwarded
         await message.reply(
-          "I can't chat here directly, but I've forwarded your message to the team — they'll get back to you soon!"
+          "I can't chat here directly, but I've forwarded your message to the Elevates team — they'll get back to you soon!"
         ).catch(() => {});
 
         // Build staff support embed
@@ -52,7 +47,6 @@ module.exports = {
         let targetChannel = null;
         const targetChannelName = config.staffDmForwardChannel || 'bot-commands';
 
-        // 1. Try to find the configured 'main' guild
         const mainConfig = await api.getMainGuildConfig().catch(() => null);
         let mainGuild = null;
 
@@ -61,7 +55,6 @@ module.exports = {
             (await message.client.guilds.fetch(mainConfig.guildId).catch(() => null));
         }
 
-        // Fallback: look through cached guilds if mainConfig wasn't explicitly set
         if (!mainGuild) {
           mainGuild = message.client.guilds.cache.first();
         }
@@ -95,7 +88,7 @@ module.exports = {
         const guildConfig = await api.getGuildConfig(message.guild.id).catch(() => null);
         if (guildConfig?.guildType !== 'chapter') return;
 
-        const unverifiedRoleName = config.roles.unverified?.toLowerCase();
+        const unverifiedRoleName = (config.roles.unverified || 'elevates').toLowerCase();
         const hasUnverifiedRole = message.member?.roles?.cache?.some(
           (r) => r.name.toLowerCase() === unverifiedRoleName
         );
@@ -112,7 +105,7 @@ module.exports = {
         unverifiedNudgeMap.set(message.author.id, now);
 
         await message.reply(
-          "Looks like you haven't verified yet! Check your DMs for the verification prompt, or ask a Campus Lead to resend it."
+          "Looks like you haven't linked your account yet! Head over to the **#link-server** channel to connect your ElevatesOS account."
         ).catch(() => {});
       } catch (err) {
         console.error('[unverifiedNudge] Error checking unverified member:', err);

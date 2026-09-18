@@ -1,6 +1,6 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const api = require('../lib/api');
-const { isLeadOrRep } = require('../lib/roleCheck');
+const { checkCommandPermission } = require('../lib/permissions');
 
 const UNIT_MS = { m: 60_000, h: 3_600_000, d: 86_400_000 };
 
@@ -21,7 +21,7 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
   async execute(interaction) {
-    if (!(await isLeadOrRep(interaction))) return;
+    if (!(await checkCommandPermission(interaction, 'mute'))) return;
 
     await interaction.deferReply();
 
@@ -68,6 +68,13 @@ module.exports = {
     const modLog = interaction.guild.channels.cache.find((c) => c.name === 'mod-log');
     if (modLog) modLog.send(`🔇 **${target.user.tag}** muted (${durationStr}) by **${interaction.user.tag}**. Reason: ${reason}`);
 
-    api.logEvent(interaction.guild.id, target.id, 'mute', { durationStr, reason, by: interaction.user.tag }).catch(() => {});
+    const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
+    api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'mute', {
+      targetId: target.id,
+      targetTag: target.user.tag,
+      durationStr,
+      reason,
+      by: interaction.user.tag,
+    }).catch(() => {});
   },
 };

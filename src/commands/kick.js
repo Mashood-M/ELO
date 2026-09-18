@@ -1,7 +1,7 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-const config = require('../config');
 const api = require('../lib/api');
-const { isLeadOrRep } = require('../lib/roleCheck');
+const { checkCommandPermission } = require('../lib/permissions');
+const config = require('../config');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -12,7 +12,7 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
 
   async execute(interaction) {
-    if (!(await isLeadOrRep(interaction))) return;
+    if (!(await checkCommandPermission(interaction, 'kick'))) return;
 
     await interaction.deferReply();
 
@@ -48,9 +48,15 @@ module.exports = {
 
     await interaction.editReply(`👢 **${target.user.tag}** was kicked. Reason: ${reason}`);
 
-    const modLog = interaction.guild.channels.cache.find((c) => c.name === config.channels?.modLog || c.name === 'mod-log');
+    const modLog = interaction.guild.channels.cache.find((c) => c.name === 'mod-log');
     if (modLog) modLog.send(`👢 **${target.user.tag}** kicked by **${interaction.user.tag}**. Reason: ${reason}`);
 
-    api.logEvent(interaction.guild.id, target.id, 'kick', { reason, by: interaction.user.tag }).catch(() => {});
+    const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
+    api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'kick', {
+      targetId: target.id,
+      targetTag: target.user.tag,
+      reason,
+      by: interaction.user.tag,
+    }).catch(() => {});
   },
 };

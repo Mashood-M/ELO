@@ -1,131 +1,73 @@
-/**
- * CHANNEL PERMISSIONS (Manual Discord server-side setup):
- * The "Guest" role should be denied View Channel on the CLUSTERS & TASKS and EVENTS
- * categories, same as Unverified currently is.
- * However, Guest should be allowed to see GENERAL (#general-chat, #introductions)
- * and WELCOME (#rules, #announcements) — unlike Unverified, which is more restricted.
- * Ensure this permission scheme is configured when cloning the Server Template.
- */
-
-const {
-  Events,
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-} = require('discord.js');
+const { Events } = require('discord.js');
 const config = require('../config');
 const api = require('../lib/api');
-const verifySessions = require('../lib/verifySessions');
-
-// Arcade color theme
-const THEME_COLOR = 0xFF6B00; // Warm arcade orange
-const PLACEHOLDER_THUMBNAIL = 'https://cdn.elevates.org/assets/arcade-avatar-placeholder.png';
+const { ensureLinkChannel } = require('../lib/accountLinking');
 
 module.exports = {
   name: Events.GuildMemberAdd,
   async execute(member) {
     try {
-      let guildConfig;
+      const guild = member.guild;
+      let guildConfig = null;
       try {
-        guildConfig = await api.getGuildConfig(member.guild.id);
+        guildConfig = await api.getGuildConfig(guild.id);
       } catch (err) {
-        console.error('Failed to fetch guild config on join:', err.message);
-        return; // fail safe: don't gate access if the API is down
+        console.error('[guildMemberAdd] Failed to fetch guild config:', err.message);
       }
 
-      // Main server: no verification, just a light welcome.
-      if (!guildConfig || guildConfig.guildType === 'main') {
-        const generalChannel = member.guild.channels.cache.find((c) => c.name === 'general-chat');
-        if (generalChannel) {
-          generalChannel.send(`Welcome ${member}! Check out #rules and #cluster-updates to see what's active.`).catch(() => {});
-        }
+      // Check if user is ALREADY linked to ElevatesOS identity
+      const identity = await api.getIdentityByDiscordId(member.id);
+
+      if (identity && identity.profile) {
+        console.log(`[guildMemberAdd] Member ${member.user.tag} is already linked as ${identity.name}. Syncing roles immediately.`);
+        // Sync roles and nickname across this guild immediately!
+        await api.syncUserAcrossGuilds(member.client, member.id);
+
+        api.logChapterEvent(member.client, guildConfig?.chapterId, guild.id, 'join_verified', {
+          username: member.user.tag,
+          discord_user_id: member.id,
+          name: identity.name,
+        }).catch(() => {});
         return;
       }
 
-      if (guildConfig.guildType === 'chapter') {
-        // 1. Assign existing Unverified role immediately (ensure it's not a bot-managed role)
-        const unverifiedRole = member.guild.roles.cache.find(
-          (r) => !r.managed && r.name.toLowerCase() === config.roles.unverified?.toLowerCase()
+      // Member is NOT linked yet
+      if (guildConfig?.guildType === 'chapter') {
+        // 1. Assign Unverified role
+        const unverifiedRole = guild.roles.cache.find(
+          (r) => !r.managed && r.name.toLowerCase() === (config.roles.unverified || 'elevates').toLowerCase()
         );
         if (unverifiedRole) {
-          try {
-            await member.roles.add(unverifiedRole);
-          } catch (err) {
-            console.error('Could not assign Unverified role:', err.message);
-          }
-        }
-
-        // Track the verification session
-        verifySessions.start(member.id, member.guild.id);
-
-        const chapterName = guildConfig.chapterName || 'Chapter';
-
-        // 2. Build arcade-styled Embed & Buttons
-        const welcomeEmbed = new EmbedBuilder()
-          .setColor(THEME_COLOR)
-          .setTitle('🕹️ WELCOME PLAYER — ACCOUNT CHECK')
-          .setDescription(
-            `Welcome to the **${chapterName}** server! 🎮\n\n` +
-            `To unlock full chapter access, clusters, and official roles, link your **ElevatesOS** account.\n\n` +
-            `**Do you already have an ElevatesOS account?**`
-          )
-          .setThumbnail(PLACEHOLDER_THUMBNAIL)
-          .setFooter({ text: 'ElevatesOS x Discord' })
-          .setTimestamp();
-
-        const buttonRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder()
-            .setCustomId('os_link_yes')
-            .setLabel('✅ Yes, I have an account')
-            .setStyle(ButtonStyle.Success),
-          new ButtonBuilder()
-            .setCustomId('os_link_no')
-            .setLabel("🆕 No, I'm new here")
-            .setStyle(ButtonStyle.Secondary)
-        );
-
-        // Find the server's welcome or verification channel
-        const me = member.guild.members.me;
-        const welcomeChannel = member.guild.channels.cache.find(
-          (c) =>
-            c.isTextBased &&
-            c.isTextBased() &&
-            (c.name === 'verify-here' || c.name.includes('welcome') || c.name.includes('verify')) &&
-            c.permissionsFor(me)?.has('SendMessages')
-        );
-
-        // 1. Always post in the welcome channel so the user sees it in the server
-        if (welcomeChannel) {
-          const canEmbed = welcomeChannel.permissionsFor(me)?.has('EmbedLinks');
-          const payload = {
-            content: `👋 Welcome ${member}! **ELEVATES ACCOUNT CONNECT** 🎮\n` +
-              `Link your **ElevatesOS** account below to unlock chapter clusters, tasks, and member roles:\n` +
-              '*(Tip: You can also use `/connect` anywhere in the server)*',
-            components: [buttonRow],
-          };
-          if (canEmbed) {
-            payload.embeds = [welcomeEmbed];
-          }
-
-          await welcomeChannel.send(payload).catch((err) => {
-            console.error('Could not post to welcome channel:', err.message);
-          });
-        } else {
-          console.warn(
-            `[guildMemberAdd] Bot lacks SendMessages permission in the welcome channel.`
+          await member.roles.add(unverifiedRole).catch((err) =>
+            console.error('[guildMemberAdd] Could not assign Unverified role:', err.message)
           );
         }
 
-        // 2. Also send via Direct Message
-        await member.send({
-          embeds: [welcomeEmbed],
-          components: [buttonRow],
-        }).catch(() => {
-          // DMs closed, already posted in welcome channel
-        });
+        // 2. Ensure #link-server has the public embed & button
+        await ensureLinkChannel(guild);
 
-        api.logEvent(member.guild.id, member.id, 'join', { username: member.user.tag }).catch(() => {});
+        // 3. Post a friendly public welcome in #link-server or #welcome (NO DMs!)
+        const linkChannel = guild.channels.cache.find(
+          (c) => c.name === 'link-server' || c.name === 'welcome' || c.name.includes('verify')
+        );
+
+        if (linkChannel && linkChannel.permissionsFor(guild.members.me)?.has('SendMessages')) {
+          linkChannel.send({
+            content: `👋 Welcome ${member}! Please click the **🔗 Connect Account** button above to connect your ElevatesOS account and unlock chapter clusters and tasks.`,
+          }).catch(() => {});
+        }
+
+        // Audit log
+        api.logChapterEvent(member.client, guildConfig.chapterId, guild.id, 'join_unverified', {
+          username: member.user.tag,
+          discord_user_id: member.id,
+        }).catch(() => {});
+      } else {
+        // Main server join
+        const generalChannel = guild.channels.cache.find((c) => c.name === 'general-chat' || c.name === 'general');
+        if (generalChannel) {
+          generalChannel.send(`Welcome ${member} to Elevates! Check out #link-server to connect your account.`).catch(() => {});
+        }
       }
     } catch (err) {
       console.error('[guildMemberAdd] Uncaught error handling new member:', err);

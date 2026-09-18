@@ -4,7 +4,7 @@ const {
 } = require('discord.js');
 const config = require('../config');
 const api = require('../lib/api');
-const { isCampusLead } = require('../lib/roleCheck');
+const { checkCommandPermission } = require('../lib/permissions');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -32,8 +32,8 @@ module.exports = {
       });
     }
 
-    // Role check: Campus Lead, Admin, Founder, or Administrator
-    if (!(await isCampusLead(interaction))) return;
+    // Role check: Campus Lead (in their own chapter) or Founder/Admin
+    if (!(await checkCommandPermission(interaction, 'reply-as-bot'))) return;
 
     const messageId = interaction.options.getString('message_id').trim();
     const replyText = interaction.options.getString('text');
@@ -56,9 +56,11 @@ module.exports = {
         ephemeral: true,
       });
 
-      api.logEvent(interaction.guild.id, interaction.user.id, 'reply_as_bot', {
+      const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
+      api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'reply_as_bot', {
         targetMessageId: messageId,
         channelId: interaction.channel.id,
+        by: interaction.user.tag,
       }).catch(() => {});
     } catch (err) {
       console.error('[reply-as-bot] Error replying to message:', err);

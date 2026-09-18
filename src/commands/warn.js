@@ -1,6 +1,6 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const api = require('../lib/api');
-const { isLeadOrRep } = require('../lib/roleCheck');
+const { checkCommandPermission } = require('../lib/permissions');
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -11,7 +11,7 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
   async execute(interaction) {
-    if (!(await isLeadOrRep(interaction))) return;
+    if (!(await checkCommandPermission(interaction, 'warn'))) return;
 
     await interaction.deferReply();
 
@@ -30,5 +30,13 @@ module.exports = {
 
     const modLog = interaction.guild.channels.cache.find((c) => c.name === 'mod-log');
     if (modLog) modLog.send(`⚠️ **${target.tag}** warned by **${interaction.user.tag}**. Reason: ${reason}`);
+
+    const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
+    api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'warn', {
+      targetId: target.id,
+      targetTag: target.tag,
+      reason,
+      by: interaction.user.tag,
+    }).catch(() => {});
   },
 };
