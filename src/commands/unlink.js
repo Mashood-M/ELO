@@ -13,7 +13,7 @@ module.exports = {
   async execute(interaction) {
     if (!(await checkCommandPermission(interaction, 'unlink'))) return;
 
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true });
 
     const target = interaction.options.getMember('member');
     if (!target) {
@@ -45,6 +45,6 @@ module.exports = {
       targetId: target.id,
       targetTag: target.user.tag,
       by: interaction.user.tag,
-    }).catch(() => {});
+    }, 'moderation').catch(() => {});
   },
 };

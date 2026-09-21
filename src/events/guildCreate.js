@@ -1,22 +1,23 @@
 const { Events, EmbedBuilder, ChannelType, PermissionFlagsBits } = require('discord.js');
 const api = require('../lib/api');
-const { ensureLinkChannel } = require('../lib/accountLinking');
 
 module.exports = {
   name: Events.GuildCreate,
   async execute(guild) {
     console.log(`[GuildCreate] Joined new guild: "${guild.name}" (${guild.id}) with ${guild.memberCount} members.`);
 
+    // 1. Wait a few seconds to allow the HTTP callback to finish first if they race
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+
     try {
-      // Check if guild is already configured
+      // 2. Check if guild_config already has an entry for this guild_id
       const config = await api.getGuildConfig(guild.id);
-      if (config && config.chapterId) {
-        console.log(`[GuildCreate] Guild ${guild.id} is already configured for chapter ${config.chapterId}.`);
-        await ensureLinkChannel(guild);
+      if (config && (config.chapterId || config.guildType === 'main')) {
+        console.log(`[GuildCreate] Guild ${guild.id} is already configured/activated (type: ${config.guildType}, chapter: ${config.chapterId}).`);
         return;
       }
 
-      // If not configured, check if we have permission to post a welcome message
+      // 3. Fallback: If not activated, post friendly message in system/welcome channel
       const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
       if (!me) return;
 
@@ -29,25 +30,19 @@ module.exports = {
         );
 
       if (welcomeChannel) {
-        const promptEmbed = new EmbedBuilder()
-          .setColor(0xFF6B00)
-          .setTitle('👋 ElevatesOS Bot Initialized')
+        const warningEmbed = new EmbedBuilder()
+          .setColor(0xF59E0B)
+          .setTitle('⚠️ Server Not Activated')
           .setDescription(
-            `Thank you for inviting the **ElevatesOS Bot** to **${guild.name}**!\n\n` +
-            `If this is a new chapter server, please have your **Campus Lead** complete server activation by running:\n` +
-            '```\n/activate-chapter token:<YOUR_SETUP_TOKEN>\n```\n' +
-            '_Tokens are obtained by running `/chapter` in the Elevates Main Server._'
+            '⚠️ This chapter server has not been activated yet. Your Campus Lead must generate an activation link using `/chapter` in the Elevates Main Server.'
           )
           .setFooter({ text: 'ElevatesOS Chapter Provisioning Engine' })
           .setTimestamp();
 
-        await welcomeChannel.send({ embeds: [promptEmbed] }).catch(() => {});
+        await welcomeChannel.send({ embeds: [warningEmbed] }).catch(() => {});
       }
-
-      // Ensure link portal channel is prepared
-      await ensureLinkChannel(guild);
     } catch (err) {
-      console.error('[GuildCreate] Error handling guild join:', err);
+      console.error('[GuildCreate] Error handling guild join fallback:', err);
     }
   },
 };

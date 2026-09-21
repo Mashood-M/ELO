@@ -7,7 +7,7 @@ module.exports = {
     .setDescription('Show the linked member count and list for this chapter.'),
 
   async execute(interaction) {
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true });
 
     let guildConfig;
     try {
@@ -44,5 +44,11 @@ module.exports = {
       .setTimestamp();
 
     await interaction.editReply({ embeds: [embed] });
-  },
+ 
+     api.logChapterEvent(interaction.client, guildConfig.chapterId, interaction.guild.id, 'cluster_directory_viewed', {
+       viewedBy: interaction.user.tag,
+       userId: interaction.user.id,
+       memberCount: members.length,
+     }, 'cluster_activity').catch(() => {});
+   },
 };

@@ -14,7 +14,7 @@ module.exports = {
   async execute(interaction) {
     if (!(await checkCommandPermission(interaction, 'kick'))) return;
 
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true });
 
     const target = interaction.options.getMember('member');
     const reason = interaction.options.getString('reason') || 'No reason given';
@@ -57,6 +57,6 @@ module.exports = {
       targetTag: target.user.tag,
       reason,
       by: interaction.user.tag,
-    }).catch(() => {});
+    }, 'moderation').catch(() => {});
   },
 };

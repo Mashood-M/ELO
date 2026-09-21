@@ -203,6 +203,17 @@ async function handleLinkModalSubmit(interaction) {
       .setTimestamp();
 
     await interaction.editReply({ embeds: [otpEmbed] });
+
+    // Log account link attempt to Founders forum
+    try {
+      const guildConfig = interaction.guildId ? await api.getGuildConfig(interaction.guildId).catch(() => null) : null;
+      api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guildId, 'link_otp_generated', {
+        discordUserId: interaction.user.id,
+        discordUserTag: interaction.user.tag,
+        elevatesUser: result.userName,
+        osUserId: result.osUserId || inputId,
+      }, 'membership').catch(() => {});
+    } catch (_) {}
   } catch (err) {
     console.error('[handleLinkModalSubmit] Error:', err);
     await interaction.editReply({

@@ -35,5 +35,12 @@ module.exports = {
       .setColor(0xFEE75C);
 
     await interaction.editReply({ embeds: [embed] });
+
+    const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
+    api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'warnings_viewed', {
+      targetId: target.id,
+      targetTag: target.tag,
+      viewedBy: interaction.user.tag,
+    }, 'moderation').catch(() => {});
   },
 };

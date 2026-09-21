@@ -69,11 +69,7 @@ module.exports = {
       // Look up chapter details if user has a chapter assigned
       let chapterName = 'Elevates Chapter';
       if (foundProfile.chapter_id) {
-        const { data: chapter } = await supabase
-          .from('chapters')
-          .select('name')
-          .eq('id', foundProfile.chapter_id)
-          .maybeSingle();
+        const chapter = await this.getChapterByIdentifier(foundProfile.chapter_id);
         if (chapter?.name) chapterName = chapter.name;
       }
 
@@ -154,10 +150,10 @@ module.exports = {
       if (error) console.error('[getIdentityByDiscordId] profiles lookup error:', error.message);
 
       if (profile) {
-        // Fetch active user roles
+        // Fetch active user roles with role definitions
         const { data: userRoles } = await supabase
           .from('user_roles')
-          .select('*')
+          .select('*, roles(name, key)')
           .eq('user_id', profile.id);
 
         return {
@@ -194,7 +190,7 @@ module.exports = {
         if (linkedProfile) {
           const { data: userRoles } = await supabase
             .from('user_roles')
-            .select('*')
+            .select('*, roles(name, key)')
             .eq('user_id', linkedProfile.id);
 
           return {
@@ -235,7 +231,7 @@ module.exports = {
 
       const { data: userRoles } = await supabase
         .from('user_roles')
-        .select('*')
+        .select('*, roles(name, key)')
         .eq('user_id', profile.id);
 
       return {
@@ -272,13 +268,100 @@ module.exports = {
   },
 
   /**
+   * Resolves a chapter by either:
+   * 1. Supabase UUID (id)
+   * 2. Elevates ID (e.g. 'CHP-0033', 'chp-0033', '33')
+   * 3. Slug or name
+   *
+   * @param {string|object} identifier UUID, Elevates ID, slug, or existing chapter object
+   * @returns {Promise<object|null>} Chapter row or null
+   */
+  async getChapterByIdentifier(identifier) {
+    if (!identifier) return null;
+    if (typeof identifier === 'object' && identifier.id) return identifier;
+
+    let clean = String(identifier).trim();
+    if (clean.startsWith('#')) clean = clean.slice(1).trim();
+
+    const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clean);
+
+    // 1. If UUID, query id directly
+    if (isUuid) {
+      try {
+        const { data, error } = await supabase
+          .from('chapters')
+          .select('*')
+          .eq('id', clean)
+          .maybeSingle();
+        if (data) return data;
+      } catch (_) {}
+    }
+
+    // 2. Elevates ID normalization (e.g. CHP-0033, chp-0033, chp33, 33)
+    let normalizedElevatesId = clean.toUpperCase();
+    const chpMatch = clean.match(/^chp-?(\d+)$/i);
+    if (chpMatch) {
+      normalizedElevatesId = 'CHP-' + chpMatch[1].padStart(4, '0');
+    } else if (/^\d+$/.test(clean)) {
+      normalizedElevatesId = 'CHP-' + clean.padStart(4, '0');
+    }
+
+    try {
+      // Try normalized elevates_id first
+      const { data: normData } = await supabase
+        .from('chapters')
+        .select('*')
+        .ilike('elevates_id', normalizedElevatesId)
+        .maybeSingle();
+      if (normData) return normData;
+
+      // Try raw input against elevates_id
+      if (clean !== normalizedElevatesId) {
+        const { data: rawData } = await supabase
+          .from('chapters')
+          .select('*')
+          .ilike('elevates_id', clean)
+          .maybeSingle();
+        if (rawData) return rawData;
+      }
+
+      // 3. Fallback: match by slug
+      const { data: slugData } = await supabase
+        .from('chapters')
+        .select('*')
+        .ilike('slug', clean)
+        .maybeSingle();
+      if (slugData) return slugData;
+
+      // 4. Fallback: match by name
+      const { data: nameData } = await supabase
+        .from('chapters')
+        .select('*')
+        .ilike('name', clean)
+        .maybeSingle();
+      if (nameData) return nameData;
+    } catch (err) {
+      console.error('[getChapterByIdentifier] Error resolving chapter:', err.message);
+    }
+
+    return null;
+  },
+
+  /**
+   * Alias for getChapterByIdentifier
+   */
+  async getChapter(identifier) {
+    return this.getChapterByIdentifier(identifier);
+  },
+
+  /**
    * Looks up which chapter a guild is mapped to.
    */
   async getGuildConfig(guildId) {
     try {
       const { data, error } = await supabase
         .from('guild_config')
-        .select('*, chapters(name, slug)')
+        .select('*, chapters(id, name, slug, elevates_id)')
         .eq('guild_id', guildId)
         .maybeSingle();
 
@@ -289,16 +372,32 @@ module.exports = {
           .eq('guild_id', guildId)
           .maybeSingle();
 
-        if (simpleErr || !simpleData) return null;
+        if (simpleErr || !simpleData) {
+          if (guildId === config.mainGuildId) {
+            return {
+              guildId,
+              guild_id: guildId,
+              guildType: 'main',
+              guild_type: 'main',
+              chapterId: null,
+              chapter_id: null,
+              chapterName: null,
+              chapter_name: null,
+              chapterElevatesId: null,
+              elevates_id: null,
+            };
+          }
+          return null;
+        }
 
         let chapterName = null;
+        let chapterElevatesId = null;
         if (simpleData.chapter_id) {
-          const { data: chapter } = await supabase
-            .from('chapters')
-            .select('name')
-            .eq('id', simpleData.chapter_id)
-            .maybeSingle();
-          if (chapter) chapterName = chapter.name;
+          const chapter = await this.getChapterByIdentifier(simpleData.chapter_id);
+          if (chapter) {
+            chapterName = chapter.name;
+            chapterElevatesId = chapter.elevates_id || null;
+          }
         }
 
         return {
@@ -310,12 +409,19 @@ module.exports = {
           chapter_id: simpleData.chapter_id,
           chapterName,
           chapter_name: chapterName,
+          chapterElevatesId,
+          elevates_id: chapterElevatesId,
+          campusLeadId: simpleData.campus_lead_id || null,
+          campus_lead_id: simpleData.campus_lead_id || null,
+          campusLeadDiscordId: simpleData.campus_lead_discord_id || null,
+          campus_lead_discord_id: simpleData.campus_lead_discord_id || null,
           createdAt: simpleData.created_at,
         };
       }
 
       const chapterObj = Array.isArray(data.chapters) ? data.chapters[0] : data.chapters;
       const chapterName = chapterObj?.name || null;
+      const chapterElevatesId = chapterObj?.elevates_id || null;
 
       return {
         guildId: data.guild_id,
@@ -326,9 +432,29 @@ module.exports = {
         chapter_id: data.chapter_id,
         chapterName,
         chapter_name: chapterName,
+        chapterElevatesId,
+        elevates_id: chapterElevatesId,
+        campusLeadId: data.campus_lead_id || null,
+        campus_lead_id: data.campus_lead_id || null,
+        campusLeadDiscordId: data.campus_lead_discord_id || null,
+        campus_lead_discord_id: data.campus_lead_discord_id || null,
         createdAt: data.created_at,
       };
     } catch (err) {
+      if (guildId === config.mainGuildId) {
+        return {
+          guildId,
+          guild_id: guildId,
+          guildType: 'main',
+          guild_type: 'main',
+          chapterId: null,
+          chapter_id: null,
+          chapterName: null,
+          chapter_name: null,
+          chapterElevatesId: null,
+          elevates_id: null,
+        };
+      }
       return null;
     }
   },
@@ -336,31 +462,41 @@ module.exports = {
   /**
    * Sets or updates guild configuration.
    */
-  async setGuildConfig(guildId, chapterId, guildType) {
+  async setGuildConfig(guildId, chapterId, guildType, campusLeadId = null, campusLeadDiscordId = null) {
     try {
+      let resolvedChapterId = chapterId;
+      let chapterObj = null;
+      if (chapterId) {
+        chapterObj = await this.getChapterByIdentifier(chapterId);
+        if (chapterObj) {
+          resolvedChapterId = chapterObj.id;
+        }
+      }
+
+      const payload = {
+        guild_id: guildId,
+        chapter_id: resolvedChapterId,
+        guild_type: guildType,
+      };
+      if (campusLeadId) payload.campus_lead_id = campusLeadId;
+      if (campusLeadDiscordId) payload.campus_lead_discord_id = campusLeadDiscordId;
+
       const { data, error } = await supabase
         .from('guild_config')
-        .upsert(
-          {
-            guild_id: guildId,
-            chapter_id: chapterId,
-            guild_type: guildType,
-          },
-          { onConflict: 'guild_id' }
-        )
+        .upsert(payload, { onConflict: 'guild_id' })
         .select()
         .single();
 
       if (error) throw formatError(error, 'Failed to set guild configuration');
 
-      let chapterName = null;
-      if (chapterId) {
-        const { data: chapter } = await supabase
-          .from('chapters')
-          .select('name')
-          .eq('id', chapterId)
-          .maybeSingle();
-        if (chapter) chapterName = chapter.name;
+      let chapterName = chapterObj?.name || null;
+      let chapterElevatesId = chapterObj?.elevates_id || null;
+      if (!chapterObj && resolvedChapterId) {
+        const chap = await this.getChapterByIdentifier(resolvedChapterId);
+        if (chap) {
+          chapterName = chap.name;
+          chapterElevatesId = chap.elevates_id || null;
+        }
       }
 
       return {
@@ -371,6 +507,9 @@ module.exports = {
         guildType: data.guild_type,
         guild_type: data.guild_type,
         chapterName,
+        chapter_name: chapterName,
+        chapterElevatesId,
+        elevates_id: chapterElevatesId,
       };
     } catch (err) {
       throw formatError(err, 'Failed to configure server');
@@ -389,7 +528,17 @@ module.exports = {
         .limit(1)
         .maybeSingle();
 
-      if (error || !data) return null;
+      if (error || !data) {
+        if (config.mainGuildId) {
+          return {
+            guildId: config.mainGuildId,
+            guild_id: config.mainGuildId,
+            guildType: 'main',
+            chapterId: null,
+          };
+        }
+        return null;
+      }
       return {
         guildId: data.guild_id,
         guild_id: data.guild_id,
@@ -397,6 +546,14 @@ module.exports = {
         chapterId: data.chapter_id,
       };
     } catch (_) {
+      if (config.mainGuildId) {
+        return {
+          guildId: config.mainGuildId,
+          guild_id: config.mainGuildId,
+          guildType: 'main',
+          chapterId: null,
+        };
+      }
       return null;
     }
   },
@@ -406,11 +563,19 @@ module.exports = {
    * Valid for 1 hour.
    */
   async createChapterSetupToken(chapterId, campusLeadDiscordId, campusLeadId = null) {
+    let resolvedChapterId = chapterId;
+    if (chapterId) {
+      const chapter = await this.getChapterByIdentifier(chapterId);
+      if (chapter) {
+        resolvedChapterId = chapter.id;
+      }
+    }
+
     const token = 'chp_' + crypto.randomBytes(16).toString('hex');
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
     const tokenData = {
-      chapter_id: chapterId,
+      chapter_id: resolvedChapterId,
       campus_lead_id: campusLeadId,
       campus_lead_discord_id: campusLeadDiscordId,
       token,
@@ -487,18 +652,27 @@ module.exports = {
     }
 
     if (!tokenData) {
-      return { ok: false, reason: 'invalid_token', message: 'Setup token not found or invalid.' };
+      return { ok: false, reason: 'invalid_token', message: 'Invalid or expired setup token. Please run /chapter again in the main server.' };
     }
 
     if (tokenData.used_at) {
-      return { ok: false, reason: 'already_used', message: 'This setup token has already been used.' };
+      return { ok: false, reason: 'already_used', message: 'Invalid or expired setup token. Please run /chapter again in the main server.' };
     }
 
     if (new Date(tokenData.expires_at) < now) {
-      return { ok: false, reason: 'expired', message: 'This setup token has expired (1-hour validity limit).' };
+      // Mark as used to prevent replaying expired tokens
+      tokenData.used_at = now.toISOString();
+      inMemorySetupTokens.set(cleanToken, tokenData);
+      try {
+        await supabase
+          .from('chapter_setup_tokens')
+          .update({ used_at: tokenData.used_at })
+          .eq('token', cleanToken);
+      } catch (_) {}
+      return { ok: false, reason: 'expired', message: 'Invalid or expired setup token. Please run /chapter again in the main server.' };
     }
 
-    // Mark as used
+    // Mark as used immediately to prevent replay attacks
     tokenData.used_at = now.toISOString();
     inMemorySetupTokens.set(cleanToken, tokenData);
 
@@ -512,7 +686,7 @@ module.exports = {
     try {
       await supabase.from('discord_events_log').insert({
         guild_id: 'global',
-        discord_user_id: callerDiscordId,
+        discord_user_id: callerDiscordId || tokenData.campus_lead_discord_id,
         event_type: 'chapter_setup_token_used',
         detail: { token: cleanToken, chapter_id: tokenData.chapter_id },
       });
@@ -522,25 +696,201 @@ module.exports = {
   },
 
   /**
-   * Provisions a new chapter guild upon /activate-chapter command.
+   * Activates a chapter server upon bot join via OAuth2 callback.
+   *
+   * @param {import('discord.js').Client} client Discord client instance
+   * @param {string} guildId Target Guild ID
+   * @param {string} token Setup token passed via OAuth2 state parameter
+   * @returns {Promise<{ ok: boolean, message?: string, chapterName?: string, guild?: any }>}
    */
-  async provisionChapterGuild(client, guild, chapterId, campusLeadMember) {
-    // 1. Fetch chapter info
-    const { data: chapter, error: chapErr } = await supabase
-      .from('chapters')
-      .select('*')
-      .eq('id', chapterId)
-      .maybeSingle();
-
-    if (chapErr || !chapter) {
-      throw formatError(chapErr, 'Failed to fetch chapter info during provisioning');
+  async activateChapter(client, guildId, token) {
+    if (!client || !guildId || !token) {
+      return {
+        ok: false,
+        message: 'Invalid or expired setup token. Please run /chapter again in the main server.',
+      };
     }
 
+    // 1. Validate and consume token
+    const tokenResult = await this.validateAndConsumeSetupToken(token);
+    if (!tokenResult || !tokenResult.ok) {
+      return {
+        ok: false,
+        message: tokenResult?.message || 'Invalid or expired setup token. Please run /chapter again in the main server.',
+      };
+    }
+
+    const { tokenData } = tokenResult;
+    const chapterId = tokenData.chapter_id;
+    const leadDiscordId = tokenData.campus_lead_discord_id;
+
+    // 2. Fetch guild with retry mechanism to handle gateway/HTTP race conditions
+    let guild = client.guilds.cache.get(guildId);
+    if (!guild) {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          guild = await client.guilds.fetch(guildId);
+          if (guild) break;
+        } catch (_) {
+          if (attempt < 5) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
+      }
+    }
+
+    if (!guild) {
+      return {
+        ok: false,
+        message: `Unable to access Discord server (${guildId}). Please ensure the bot was successfully added to your server.`,
+      };
+    }
+
+    // 3. Verify server is not the Main Server
+    let existingConfig = null;
+    try {
+      existingConfig = await this.getGuildConfig(guild.id);
+    } catch (_) {}
+
+    if (existingConfig && existingConfig.guildType === 'main') {
+      return {
+        ok: false,
+        message: 'This server is configured as the Main Server and cannot be converted into a chapter server.',
+      };
+    }
+
+    // 4. Resolve Campus Lead member
+    let campusLeadMember = null;
+    if (leadDiscordId) {
+      try {
+        campusLeadMember = guild.members.cache.get(leadDiscordId) ||
+          (await guild.members.fetch(leadDiscordId).catch(() => null));
+      } catch (_) {}
+    }
+
+    // 5. Run provisioning logic
+    let provisioningResult;
+    try {
+      provisioningResult = await this.provisionChapterGuild(
+        client,
+        guild,
+        chapterId,
+        campusLeadMember
+      );
+    } catch (err) {
+      console.error('[activateChapter] Error during chapter provisioning:', err);
+      return {
+        ok: false,
+        message: `An error occurred during chapter provisioning: ${err.message}`,
+      };
+    }
+
+    // 6. Explicitly ensure Campus Lead role is assigned to the lead member
+    if (campusLeadMember && provisioningResult?.campusLeadRole) {
+      if (!campusLeadMember.roles.cache.has(provisioningResult.campusLeadRole.id)) {
+        await campusLeadMember.roles.add(provisioningResult.campusLeadRole).catch((roleErr) =>
+          console.warn('[activateChapter] Could not add Campus Lead role to caller:', roleErr.message)
+        );
+      }
+    }
+
+    // 7. Trigger initial cluster synchronization for this chapter
+    const { syncChapterClusters } = require('./clusterSync');
+    syncChapterClusters(client, chapterId).catch((err) =>
+      console.error('[activateChapter] Cluster sync error:', err.message)
+    );
+
+    // 8. Post welcome embed in chapter server
+    try {
+      const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+      const welcomeChannel =
+        guild.systemChannel ||
+        guild.channels.cache.find(
+          (c) =>
+            c.type === ChannelType.GuildText &&
+            c.name !== 'link-server' &&
+            c.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages)
+        );
+
+      if (welcomeChannel) {
+        const linkChannel = guild.channels.cache.find((c) => c.name === 'link-server');
+        const welcomeEmbed = new EmbedBuilder()
+          .setColor(0x22C55E)
+          .setTitle(`🎉 ${provisioningResult.chapterName} Discord Server Activated!`)
+          .setDescription(
+            `This server is now officially linked to the **${provisioningResult.chapterName}** chapter on ElevatesOS!\n\n` +
+            `• **Elevates Chapter ID:** \`${provisioningResult.elevatesId || chapterId}\`\n` +
+            `• **Campus Lead:** ${campusLeadMember ? `<@${campusLeadMember.id}>` : 'Configured'}\n` +
+            `• **Campus Lead Role:** Configured with **Administrator** access\n` +
+            `• **Chapter Roles:** Provisioned from ElevatesOS\n` +
+            `• **Account Linking:** Head over to ${linkChannel ? `<#${linkChannel.id}>` : '`#link-server`'} to connect your account.\n\n` +
+            `Private cluster categories and channels will synchronize automatically.`
+          )
+          .setFooter({ text: 'ElevatesOS Chapter Provisioning Engine' })
+          .setTimestamp();
+
+        await welcomeChannel.send({ embeds: [welcomeEmbed] }).catch(() => {});
+      }
+    } catch (welcomeErr) {
+      console.warn('[activateChapter] Could not post welcome embed:', welcomeErr.message);
+    }
+
+    // 9. Log activation event in main server forum
+    this.logChapterEvent(client, chapterId, guild.id, 'chapter_activated', {
+      activatedBy: campusLeadMember ? campusLeadMember.user.tag : (leadDiscordId || 'OAuth2 Join'),
+      guildName: guild.name,
+      guildId: guild.id,
+    }, 'channel_role_changes').catch(() => {});
+
+    return {
+      ok: true,
+      chapterName: provisioningResult.chapterName,
+      guild,
+    };
+  },
+
+  /**
+   * Provisions a new chapter guild.
+   */
+  async provisionChapterGuild(client, guild, chapterIdOrIdentifier, campusLeadMember) {
+    // Safety guard: The Main Server must NEVER be provisioned or have roles auto-created
+    const currentConfig = await this.getGuildConfig(guild.id);
+    if (currentConfig?.guildType === 'main' || guild.id === config.mainGuildId) {
+      throw new Error('This server is configured as the Main Server and cannot be provisioned as a chapter server.');
+    }
+
+    // 1. Fetch chapter info - supports UUID, elevates_id (e.g. CHP-0033), or existing chapter object
+    const chapter = typeof chapterIdOrIdentifier === 'object' && chapterIdOrIdentifier !== null && chapterIdOrIdentifier.id
+      ? chapterIdOrIdentifier
+      : await this.getChapterByIdentifier(chapterIdOrIdentifier);
+
+    if (!chapter) {
+      throw new Error(`Failed to fetch chapter info for "${chapterIdOrIdentifier}" during provisioning`);
+    }
+
+    const chapterId = chapter.id;
+    const chapterElevatesId = chapter.elevates_id || chapter.id;
     const chapterName = chapter.name || 'Chapter';
     const chapterSlug = (chapter.slug || chapterName).toLowerCase().replace(/[^a-z0-9]+/g, '-');
 
-    // 2. Set guild_config
-    await this.setGuildConfig(guild.id, chapterId, 'chapter');
+    // 2. Set guild_config with Campus Lead identity
+    let campusLeadProfileId = null;
+    if (campusLeadMember) {
+      const leadIdentity = await this.getIdentityByDiscordId(campusLeadMember.id);
+      campusLeadProfileId = leadIdentity?.profile?.id || null;
+    }
+    await this.setGuildConfig(guild.id, chapterId, 'chapter', campusLeadProfileId, campusLeadMember?.id);
+
+    // If campus lead profile is identified and chapter.campus_lead_id is unassigned, link them in chapters table
+    if (campusLeadProfileId && !chapter.campus_lead_id) {
+      try {
+        await supabase
+          .from('chapters')
+          .update({ campus_lead_id: campusLeadProfileId })
+          .eq('id', chapterId)
+          .is('campus_lead_id', null);
+      } catch (_) {}
+    }
 
     // 3. Fetch all OS roles from roles table and create in guild
     const osRoles = await this.getAllOsRoles();
@@ -621,89 +971,22 @@ module.exports = {
       }
     }
 
-    // 4. In the MAIN server, create Chapter Management category & dedicated channel
-    let mainGuild = null;
-    const mainConfig = await this.getMainGuildConfig();
-    if (mainConfig?.guildId) {
-      mainGuild = client.guilds.cache.get(mainConfig.guildId) ||
-        (await client.guilds.fetch(mainConfig.guildId).catch(() => null));
-    }
-    if (!mainGuild) {
-      // Fallback: look for guild configured as main or first guild
-      mainGuild = client.guilds.cache.find((g) => g.id !== guild.id) || client.guilds.cache.first();
-    }
-
+    // 4. In the MAIN server, ensure Chapter Management category & dedicated forum log channel
     let chapterManagementLogChannel = null;
-    if (mainGuild) {
-      try {
-        // Find or create "Chapter Management" category
-        let category = mainGuild.channels.cache.find(
-          (c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase().includes('chapter management')
-        );
-        if (!category) {
-          category = await mainGuild.channels.create({
-            name: 'Chapter Management',
-            type: ChannelType.GuildCategory,
-            reason: 'ElevatesOS Chapter Oversight',
-          });
-        }
+    try {
+      const forumData = await this.ensureChapterLogForum(client, chapterId);
+      chapterManagementLogChannel = forumData?.forumChannel || null;
 
-        // Find Founder / HQ Admin role in main guild for channel permissions
-        const founderRole = mainGuild.roles.cache.find(
-          (r) =>
-            r.name.toLowerCase().includes('founder') ||
-            r.name.toLowerCase() === (config.roles.founder || '').toLowerCase()
-        );
-
-        const channelName = `chp-${chapterSlug}`.slice(0, 100);
-        chapterManagementLogChannel = mainGuild.channels.cache.find(
-          (c) => c.name === channelName && c.parentId === category.id
-        );
-
-        if (!chapterManagementLogChannel) {
-          const permissionOverwrites = [
-            {
-              id: mainGuild.roles.everyone.id,
-              deny: [PermissionFlagsBits.ViewChannel],
-            },
-            {
-              id: client.user.id,
-              allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.SendMessages,
-                PermissionFlagsBits.EmbedLinks,
-              ],
-            },
-          ];
-
-          if (founderRole) {
-            permissionOverwrites.push({
-              id: founderRole.id,
-              allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.SendMessages,
-                PermissionFlagsBits.ReadMessageHistory,
-              ],
-            });
-          }
-
-          chapterManagementLogChannel = await mainGuild.channels.create({
-            name: channelName,
-            type: ChannelType.GuildText,
-            parent: category.id,
-            topic: `ElevatesOS Official Audit Log for ${chapterName} Chapter (${chapterId})`,
-            permissionOverwrites,
-            reason: `Log channel for ${chapterName} Chapter`,
-          });
-        }
-
-        // Post chapter activated log message
+      // Post chapter activated log message in "Channel & Role Changes" starter thread
+      const chgThread = forumData?.threadMap?.['channel_role_changes'] || chapterManagementLogChannel;
+      if (chgThread) {
         const activationEmbed = new EmbedBuilder()
           .setColor(0x22C55E)
           .setTitle(`🏛️ Chapter Activated: ${chapterName}`)
           .setDescription(
             `A new chapter Discord server has been successfully provisioned and linked to ElevatesOS!\n\n` +
             `• **Chapter Name:** ${chapterName}\n` +
+            `• **Elevates ID:** \`${chapterElevatesId}\`\n` +
             `• **Chapter ID:** \`${chapterId}\`\n` +
             `• **Guild ID:** \`${guild.id}\`\n` +
             `• **Campus Lead:** ${campusLeadMember ? `<@${campusLeadMember.id}>` : 'None'}\n` +
@@ -712,10 +995,10 @@ module.exports = {
           .setFooter({ text: 'ElevatesOS Chapter Oversight' })
           .setTimestamp();
 
-        await chapterManagementLogChannel.send({ embeds: [activationEmbed] }).catch(() => {});
-      } catch (mainErr) {
-        console.error('[provisionChapterGuild] Error setting up main server log channel:', mainErr);
+        await chgThread.send({ embeds: [activationEmbed] }).catch(() => {});
       }
+    } catch (mainErr) {
+      console.error('[provisionChapterGuild] Error setting up main server log forum:', mainErr);
     }
 
     // 5. Post public account link message in chapter server
@@ -727,6 +1010,8 @@ module.exports = {
     return {
       chapterName,
       chapterSlug,
+      chapterId,
+      elevatesId: chapterElevatesId,
       guildId: guild.id,
       campusLeadRole,
       logChannel: chapterManagementLogChannel,
@@ -734,59 +1019,305 @@ module.exports = {
   },
 
   /**
-   * Centralized event logger that logs to discord_events_log
-   * AND forwards chapter-specific events to the Chapter Management channel in the main server.
+   * Ensures the Chapter Management Category, the chapter's dedicated FORUM log channel,
+   * and the 4 starter threads exist in the Main Server.
+   *
+   * Starter threads:
+   * - "🛡️ Moderation" — kicks, bans, mutes, warns, unlinks
+   * - "🧠 Cluster Activity" — cluster created, member added/removed, host assigned/removed
+   * - "⚙️ Channel & Role Changes" — any role or channel created/modified for this chapter
+   * - "👤 Membership" — member joined/left the chapter server, account linked/unlinked
    */
-  async logChapterEvent(client, chapterId, guildId, eventType, detail = {}) {
+  async ensureChapterLogForum(client, chapterId) {
+    if (!client || !chapterId) return null;
+
     try {
-      // 1. Insert into database audit log
-      await supabase.from('discord_events_log').insert({
-        guild_id: guildId || 'global',
-        discord_user_id: detail.discord_user_id || detail.userId || null,
-        event_type: eventType,
-        detail,
-      });
+      const chapter = await this.getChapterByIdentifier(chapterId);
+      if (!chapter) return null;
 
-      // 2. Forward to Main Server's dedicated chapter channel if this is a chapter
-      if (!chapterId || !client) return;
-
-      const { data: chapter } = await supabase
-        .from('chapters')
-        .select('name, slug')
-        .eq('id', chapterId)
-        .maybeSingle();
-
-      if (!chapter) return;
-
-      const chapterSlug = (chapter.slug || chapter.name).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const chapterName = chapter.name || 'Chapter';
+      const chapterSlug = (chapter.slug || chapterName).toLowerCase().replace(/[^a-z0-9]+/g, '-');
       const channelName = `chp-${chapterSlug}`.slice(0, 100);
 
-      // Locate channel in main guild
-      for (const [, guild] of client.guilds.cache) {
-        const logChannel = guild.channels.cache.find(
-          (c) => c.name === channelName && c.isTextBased && c.isTextBased()
-        );
-        if (logChannel) {
-          const embed = new EmbedBuilder()
-            .setColor(
-              eventType.includes('ban') || eventType.includes('kick') || eventType.includes('unlink')
-                ? 0xEF4444
-                : eventType.includes('warn')
-                ? 0xF59E0B
-                : 0x3B82F6
-            )
-            .setTitle(`📌 Chapter Event: ${eventType.toUpperCase()}`)
-            .setDescription(
-              Object.entries(detail)
-                .map(([k, v]) => `• **${k}:** ${typeof v === 'object' ? JSON.stringify(v) : v}`)
-                .join('\n') || 'No additional details.'
-            )
-            .setFooter({ text: `${chapter.name} Chapter Audit Log` })
-            .setTimestamp();
+      // 1. Locate Main Server
+      let mainGuild = null;
+      const mainConfig = await this.getMainGuildConfig();
+      if (mainConfig?.guildId) {
+        mainGuild = client.guilds.cache.get(mainConfig.guildId) ||
+          (await client.guilds.fetch(mainConfig.guildId).catch(() => null));
+      }
+      if (!mainGuild) {
+        mainGuild = client.guilds.cache.find((g) => g.id !== mainConfig?.guildId) || client.guilds.cache.first();
+      }
+      if (!mainGuild) return null;
 
-          await logChannel.send({ embeds: [embed] }).catch(() => {});
-          break;
+      // 2. Find or create "Chapter Management" category
+      let category = mainGuild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase().includes('chapter management')
+      );
+      if (!category) {
+        category = await mainGuild.channels.create({
+          name: 'Chapter Management',
+          type: ChannelType.GuildCategory,
+          reason: 'ElevatesOS Chapter Oversight',
+        });
+      }
+
+      // 3. Setup Founders-only permissions
+      const founderRole = mainGuild.roles.cache.find(
+        (r) =>
+          r.name.toLowerCase().includes('founder') ||
+          r.name.toLowerCase() === (config.roles.founder || '').toLowerCase()
+      );
+
+      const permissionOverwrites = [
+        {
+          id: mainGuild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel],
+        },
+        {
+          id: client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageThreads,
+            PermissionFlagsBits.CreatePublicThreads,
+            PermissionFlagsBits.CreatePrivateThreads,
+            PermissionFlagsBits.SendMessagesInThreads,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        },
+      ];
+
+      if (founderRole) {
+        permissionOverwrites.push({
+          id: founderRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.SendMessagesInThreads,
+          ],
+        });
+      }
+
+      // 4. Find or create Forum channel
+      let forumChannel = mainGuild.channels.cache.find(
+        (c) => c.name === channelName && c.parentId === category.id
+      );
+
+      // If existing channel is flat text, delete it to replace with Forum
+      if (forumChannel && forumChannel.type !== ChannelType.GuildForum) {
+        await forumChannel.delete('Replacing flat text log channel with Forum channel').catch(() => {});
+        forumChannel = null;
+      }
+
+      if (!forumChannel) {
+        try {
+          forumChannel = await mainGuild.channels.create({
+            name: channelName,
+            type: ChannelType.GuildForum,
+            parent: category.id,
+            topic: `ElevatesOS Official Audit Log for ${chapterName} Chapter (${chapterId})`,
+            permissionOverwrites,
+            reason: `Forum audit log channel for ${chapterName} Chapter`,
+          });
+        } catch (forumErr) {
+          // Fallback to GuildText if guild lacks COMMUNITY feature
+          console.warn(`[ensureChapterLogForum] GuildForum creation failed, falling back to GuildText:`, forumErr.message);
+          forumChannel = await mainGuild.channels.create({
+            name: channelName,
+            type: ChannelType.GuildText,
+            parent: category.id,
+            topic: `ElevatesOS Official Audit Log for ${chapterName} Chapter (${chapterId})`,
+            permissionOverwrites,
+            reason: `Fallback audit log channel for ${chapterName} Chapter`,
+          }).catch(() => null);
         }
+      }
+
+      if (!forumChannel) return null;
+
+      // 5. Ensure the 4 starter threads exist
+      const STARTER_THREADS = [
+        {
+          key: 'moderation',
+          name: '🛡️ Moderation',
+          description: 'kicks, bans, mutes, warns, and unlinks',
+        },
+        {
+          key: 'cluster_activity',
+          name: '🧠 Cluster Activity',
+          description: 'cluster created, member added/removed, host assigned/removed',
+        },
+        {
+          key: 'channel_role_changes',
+          name: '⚙️ Channel & Role Changes',
+          description: 'any role or channel created or modified for this chapter',
+        },
+        {
+          key: 'membership',
+          name: '👤 Membership',
+          description: 'member joined/left the chapter server, account linked/unlinked',
+        },
+      ];
+
+      const threadMap = {};
+
+      if (forumChannel.type === ChannelType.GuildForum) {
+        const fetchedActive = await forumChannel.threads.fetchActive().catch(() => ({ threads: new Map() }));
+        const activeThreads = fetchedActive.threads || new Map();
+
+        for (const tSpec of STARTER_THREADS) {
+          let thread = Array.from(activeThreads.values()).find(
+            (th) =>
+              th.name.toLowerCase().trim() === tSpec.name.toLowerCase().trim() ||
+              th.name.toLowerCase().replace(/[^a-z0-9]/g, '') === tSpec.name.toLowerCase().replace(/[^a-z0-9]/g, '')
+          );
+
+          if (!thread) {
+            try {
+              thread = await forumChannel.threads.create({
+                name: tSpec.name,
+                message: {
+                  content: `**${tSpec.name} Audit Log Thread**\nOfficial log of all ${tSpec.description} for **${chapterName}**.\n\n_Auto-managed by ElevatesOS._`,
+                },
+                reason: `Starter audit thread for ${chapterName}`,
+              });
+            } catch (thErr) {
+              console.error(`[ensureChapterLogForum] Could not create thread ${tSpec.name}:`, thErr.message);
+            }
+          }
+
+          if (thread) {
+            threadMap[tSpec.key] = thread;
+          }
+        }
+      }
+
+      // 6. Update references in chapter_log_channels table
+      try {
+        await supabase
+          .from('chapter_log_channels')
+          .upsert(
+            {
+              chapter_id: chapterId,
+              main_guild_id: mainGuild.id,
+              channel_id: forumChannel.id,
+              moderation_thread_id: threadMap['moderation']?.id || null,
+              cluster_activity_thread_id: threadMap['cluster_activity']?.id || null,
+              channel_role_changes_thread_id: threadMap['channel_role_changes']?.id || null,
+              membership_thread_id: threadMap['membership']?.id || null,
+            },
+            { onConflict: 'chapter_id' }
+          );
+      } catch (err) {
+        console.warn('[ensureChapterLogForum] Could not update chapter_log_channels:', err.message);
+      }
+
+      return {
+        forumChannel,
+        threadMap,
+        chapterName,
+      };
+    } catch (err) {
+      console.error('[ensureChapterLogForum] Error:', err);
+      return null;
+    }
+  },
+
+  /**
+   * Centralized event logger that logs to discord_events_log
+   * AND routes chapter-specific events to the appropriate starter thread in the chapter's log forum.
+   *
+   * Categories:
+   * - "moderation": kicks, bans, mutes, warns, unlinks
+   * - "cluster_activity": cluster created, member added/removed, host assigned/removed
+   * - "channel_role_changes": any role or channel created/modified for this chapter
+   * - "membership": member joined/left the chapter server, account linked/unlinked
+   */
+  async logChapterEvent(client, chapterId, guildId, eventType, detail = {}, category = null) {
+    try {
+      // 1. Insert into database audit log
+      try {
+        await supabase.from('discord_events_log').insert({
+          guild_id: guildId || 'global',
+          discord_user_id: detail.discord_user_id || detail.userId || detail.targetId || null,
+          event_type: eventType,
+          detail,
+        });
+      } catch (_) {}
+
+      // 2. Resolve chapterId if not provided
+      if (!chapterId && guildId) {
+        const guildConfig = await this.getGuildConfig(guildId);
+        chapterId = guildConfig?.chapterId;
+      }
+
+      if (!chapterId || !client) return;
+
+      // 3. Determine log category
+      let targetCategory = category;
+      if (!targetCategory) {
+        const t = (eventType || '').toLowerCase();
+        if (
+          t.includes('kick') ||
+          t.includes('ban') ||
+          t.includes('mute') ||
+          t.includes('warn') ||
+          t.includes('unlink') ||
+          t === 'moderation'
+        ) {
+          targetCategory = 'moderation';
+        } else if (t.includes('cluster') || t.includes('host')) {
+          targetCategory = 'cluster_activity';
+        } else if (
+          t.includes('join') ||
+          t.includes('leave') ||
+          t.includes('link') ||
+          t.includes('member_join') ||
+          t.includes('member_leave') ||
+          t === 'membership'
+        ) {
+          targetCategory = 'membership';
+        } else {
+          targetCategory = 'channel_role_changes';
+        }
+      }
+
+      // 4. Ensure Forum channel and starter threads exist in Main Guild
+      const forumData = await this.ensureChapterLogForum(client, chapterId);
+      if (!forumData) return;
+
+      const { forumChannel, threadMap, chapterName } = forumData;
+      const targetDestination = threadMap[targetCategory] || forumChannel;
+
+      // 5. Post embed into the target thread
+      const embed = new EmbedBuilder()
+        .setColor(
+          eventType.includes('ban') || eventType.includes('kick') || eventType.includes('unlink')
+            ? 0xEF4444
+            : eventType.includes('warn')
+            ? 0xF59E0B
+            : eventType.includes('cluster')
+            ? 0x8B5CF6
+            : eventType.includes('join') || eventType.includes('activate')
+            ? 0x22C55E
+            : 0x3B82F6
+        )
+        .setTitle(`📌 Event: ${eventType.toUpperCase().replace(/_/g, ' ')}`)
+        .setDescription(
+          Object.entries(detail)
+            .map(([k, v]) => `• **${k}:** ${typeof v === 'object' ? JSON.stringify(v) : v}`)
+            .join('\n') || 'No additional details.'
+        )
+        .setFooter({ text: `${chapterName} Audit Log • ${targetCategory}` })
+        .setTimestamp();
+
+      if (targetDestination && typeof targetDestination.send === 'function') {
+        await targetDestination.send({ embeds: [embed] }).catch((err) => {
+          console.error(`[logChapterEvent] Could not send message to log thread:`, err.message);
+        });
       }
     } catch (err) {
       console.error('[logChapterEvent] Error logging event:', err.message);
@@ -804,20 +1335,23 @@ module.exports = {
       let identity = null;
       if (discordUserId) {
         identity = await this.getIdentityByDiscordId(discordUserId);
-      } else if (osUserId) {
+      }
+      if (!identity && osUserId) {
         identity = await this.getIdentityByOsUserId(osUserId);
       }
 
-      if (!identity || !identity.profile) {
-        return;
-      }
-
-      const profile = identity.profile;
-      const targetDiscordId = profile.discord_user_id || discordUserId;
+      const profile = identity?.profile || null;
+      const targetDiscordId = discordUserId || profile?.discord_user_id || identity?.discord_user_id;
       if (!targetDiscordId) return;
 
-      const userChapterId = profile.chapter_id;
-      const userRoles = identity.userRoles || [];
+      const isConnected = Boolean(
+        profile &&
+        profile.discord_connected &&
+        (profile.discord_user_id === targetDiscordId || identity?.discord_user_id === targetDiscordId)
+      );
+
+      const userChapterId = profile?.chapter_id || identity?.chapterId;
+      const userRoles = identity?.userRoles || [];
 
       // Iterate through all cached guilds the bot is in
       for (const [, guild] of client.guilds.cache) {
@@ -837,7 +1371,10 @@ module.exports = {
           (r) => !r.managed && r.name.toLowerCase() === (config.roles.verified || 'ELEVATES • Member').toLowerCase()
         );
         const unverifiedRole = guild.roles.cache.find(
-          (r) => !r.managed && r.name.toLowerCase() === (config.roles.unverified || 'elevates').toLowerCase()
+          (r) => !r.managed && (
+            r.name.toLowerCase() === 'unverified' ||
+            r.name.toLowerCase() === (config.roles.unverified || 'elevates').toLowerCase()
+          )
         );
         const guestRole = guild.roles.cache.find(
           (r) => !r.managed && r.name.toLowerCase() === (config.roles.guest || 'Guest').toLowerCase()
@@ -845,15 +1382,170 @@ module.exports = {
 
         // CASE 1: Main Server
         if (guildType === 'main') {
-          if (profile.discord_connected) {
-            if (verifiedRole && !member.roles.cache.has(verifiedRole.id)) {
-              await member.roles.add(verifiedRole).catch(() => {});
+          const allowedFixedRoles = config.mainRoles.allowedRoles;
+
+          if (isConnected && profile) {
+            const targetRoleNames = new Set();
+
+            // Default base role for all verified connected members
+            targetRoleNames.add(config.mainRoles.defaultRole); // 'Verified Member'
+
+            // Gather all OS role keys and names for this user across all chapters and globally
+            const userRoleKeys = new Set();
+            const userRoleNames = new Set();
+
+            if (userRoles && userRoles.length > 0) {
+              for (const r of userRoles) {
+                const k = (r.role_key || r.role || '').toLowerCase().trim();
+                if (k) userRoleKeys.add(k);
+                if (r.roles?.name) userRoleNames.add(r.roles.name.trim());
+                if (r.roles?.key) userRoleKeys.add(r.roles.key.toLowerCase().trim());
+              }
+            } else {
+              // Fallback only when user has NO assigned records in user_roles
+              if (profile.designation) {
+                userRoleKeys.add(profile.designation.toLowerCase().trim());
+              }
+              if (profile.role) {
+                userRoleKeys.add(profile.role.toLowerCase().trim());
+              }
             }
-            if (unverifiedRole && member.roles.cache.has(unverifiedRole.id)) {
-              await member.roles.remove(unverifiedRole).catch(() => {});
+
+            // High-level administrative roles directly from profile if assigned
+            if (profile.role && ['founder', 'hq_admin', 'admin'].includes(profile.role.toLowerCase().trim())) {
+              userRoleKeys.add(profile.role.toLowerCase().trim());
             }
-            if (profile.full_name) {
+
+            // Check if user is campus_lead for ANY chapter in chapters table
+            try {
+              const { data: leadChapters } = await supabase
+                .from('chapters')
+                .select('id')
+                .eq('campus_lead_id', profile.id)
+                .limit(1);
+              if (leadChapters && leadChapters.length > 0) {
+                userRoleKeys.add('campus_lead');
+                userRoleNames.add('Campus Lead');
+              }
+            } catch (_) {}
+
+            // Map each OS role to the main server fixed role
+            for (const rKey of userRoleKeys) {
+              const mapped = config.mainRoles.getMainRoleForOsRole(rKey);
+              if (mapped) {
+                targetRoleNames.add(mapped);
+              }
+            }
+
+            // Also check any roles in the guild that match official OS role names or userRoleNames
+            for (const [, gRole] of guild.roles.cache) {
+              if (gRole.managed) continue;
+              const gName = gRole.name.toLowerCase().trim();
+              for (const rKey of userRoleKeys) {
+                if (gName === rKey || gName === rKey.replace(/_/g, ' ')) {
+                  targetRoleNames.add(gRole.name);
+                }
+              }
+              for (const rName of userRoleNames) {
+                if (gName === rName.toLowerCase()) {
+                  targetRoleNames.add(gRole.name);
+                }
+              }
+            }
+
+            // Unverified should NEVER be held by a connected member
+            targetRoleNames.delete('Unverified');
+
+            // If user's only role is guest, do not assign Verified Member
+            if (userRoleKeys.has('guest') && userRoleKeys.size === 1) {
+              targetRoleNames.delete('Verified Member');
+              targetRoleNames.add('Guest');
+            }
+
+            // Collect all OS-managed roles in the guild that the bot handles
+            const allOsRoles = await this.getAllOsRoles();
+            const osManagedRoleNames = new Set(allowedFixedRoles);
+            for (const r of allOsRoles) {
+              if (r.name) osManagedRoleNames.add(r.name);
+            }
+            osManagedRoleNames.add('ELEVATES • Founder');
+            osManagedRoleNames.add('ELEVATES • Admin');
+
+            for (const roleName of osManagedRoleNames) {
+              let discordRole = guild.roles.cache.find(
+                (r) => !r.managed && r.name.toLowerCase().trim() === roleName.toLowerCase().trim()
+              );
+              if (!discordRole && roleName === 'Founder') {
+                discordRole = guild.roles.cache.find((r) => !r.managed && r.name === 'ELEVATES • Founder');
+              }
+              if (!discordRole && (roleName === 'HQ Admin' || roleName === 'Admin')) {
+                discordRole = guild.roles.cache.find(
+                  (r) => !r.managed && (r.name === 'HQ Admin' || r.name === 'ELEVATES • Admin')
+                );
+              }
+              if (!discordRole) continue;
+
+              const shouldHave =
+                targetRoleNames.has(roleName) ||
+                targetRoleNames.has(discordRole.name) ||
+                (roleName === 'Founder' && (targetRoleNames.has('Founder') || targetRoleNames.has('ELEVATES • Founder'))) ||
+                ((roleName === 'HQ Admin' || roleName === 'Admin') && (targetRoleNames.has('HQ Admin') || targetRoleNames.has('Admin') || targetRoleNames.has('ELEVATES • Admin'))) ||
+                ((roleName === 'Class Rep' || roleName === 'Class Representative') && (targetRoleNames.has('Class Rep') || targetRoleNames.has('Class Representative')));
+
+              const currentlyHas = member.roles.cache.has(discordRole.id);
+
+              if (shouldHave && !currentlyHas) {
+                try {
+                  await member.roles.add(discordRole);
+                  console.log(`[syncUserAcrossGuilds] Added main role "${discordRole.name}" to ${member.user.tag}`);
+                } catch (err) {
+                  console.warn(`[syncUserAcrossGuilds] Could not add main role "${discordRole.name}" to ${member.user.tag}:`, err.message);
+                }
+              } else if (!shouldHave && currentlyHas) {
+                try {
+                  await member.roles.remove(discordRole);
+                  console.log(`[syncUserAcrossGuilds] Removed main role "${discordRole.name}" from ${member.user.tag}`);
+                } catch (err) {
+                  console.warn(`[syncUserAcrossGuilds] Could not remove main role "${discordRole.name}" from ${member.user.tag}:`, err.message);
+                }
+              }
+            }
+
+            if (profile.full_name && member.displayName !== profile.full_name) {
               await member.setNickname(profile.full_name).catch(() => {});
+            }
+          } else {
+            // Member is NOT linked / disconnected in the Main Server
+            if (unverifiedRole && !member.roles.cache.has(unverifiedRole.id)) {
+              await member.roles.add(unverifiedRole).catch(() => {});
+            }
+
+            // Remove any assigned fixed membership/leadership roles
+            const allOsRoles = await this.getAllOsRoles();
+            const osManagedRoleNames = new Set(allowedFixedRoles);
+            for (const r of allOsRoles) {
+              if (r.name) osManagedRoleNames.add(r.name);
+            }
+            osManagedRoleNames.add('ELEVATES • Founder');
+            osManagedRoleNames.add('ELEVATES • Admin');
+
+            for (const roleName of osManagedRoleNames) {
+              if (roleName === 'Unverified') continue;
+              let discordRole = guild.roles.cache.find(
+                (r) => !r.managed && r.name.toLowerCase().trim() === roleName.toLowerCase().trim()
+              );
+              if (!discordRole && roleName === 'Founder') {
+                discordRole = guild.roles.cache.find((r) => !r.managed && r.name === 'ELEVATES • Founder');
+              }
+              if (!discordRole && (roleName === 'HQ Admin' || roleName === 'Admin')) {
+                discordRole = guild.roles.cache.find(
+                  (r) => !r.managed && (r.name === 'HQ Admin' || r.name === 'ELEVATES • Admin')
+                );
+              }
+              if (discordRole && member.roles.cache.has(discordRole.id)) {
+                await member.roles.remove(discordRole).catch(() => {});
+                console.log(`[syncUserAcrossGuilds] Removed main role "${discordRole.name}" from unlinked ${member.user.tag}`);
+              }
             }
           }
           continue;
@@ -861,7 +1553,7 @@ module.exports = {
 
         // CASE 2: Chapter Server matching member's current OS chapter
         if (guildType === 'chapter' && guildChapterId === userChapterId) {
-          if (profile.discord_connected) {
+          if (isConnected && profile) {
             // 1. Ensure verified role and remove unverified/guest
             if (verifiedRole && !member.roles.cache.has(verifiedRole.id)) {
               await member.roles.add(verifiedRole).catch(() => {});
@@ -881,19 +1573,37 @@ module.exports = {
             // 3. Reconcile Chapter Roles: Campus Lead, Class Rep, Student, etc.
             const userChapterRoleKeys = new Set(
               userRoles
-                .filter((r) => r.chapter_id === userChapterId || !r.chapter_id)
+                .filter((r) => r.chapter_id === guildChapterId || !r.chapter_id)
                 .map((r) => (r.role_key || r.role || '').toLowerCase().trim())
             );
 
-            if (profile.designation) userChapterRoleKeys.add(profile.designation.toLowerCase().trim());
-            if (profile.role) userChapterRoleKeys.add(profile.role.toLowerCase().trim());
+            // Include profile designation and role ONLY if user has no assigned records in user_roles
+            if (userRoles.length === 0 && (userChapterId === guildChapterId || !userChapterId)) {
+              if (profile.designation) userChapterRoleKeys.add(profile.designation.toLowerCase().trim());
+              if (profile.role) userChapterRoleKeys.add(profile.role.toLowerCase().trim());
+            }
+
+            // Also check if user is the assigned campus_lead for this chapter in chapters table
+            try {
+              const { data: chRow } = await supabase
+                .from('chapters')
+                .select('campus_lead_id')
+                .eq('id', guildChapterId)
+                .maybeSingle();
+              if (chRow && chRow.campus_lead_id === profile.id) {
+                userChapterRoleKeys.add('campus_lead');
+              }
+            } catch (_) {}
 
             // Fetch all OS role definitions to map them to Discord roles
             const allRoles = await this.getAllOsRoles();
             for (const rDef of allRoles) {
               const rName = rDef.name || rDef.key;
               const gRole = guild.roles.cache.find(
-                (r) => r.name.toLowerCase().trim() === rName.toLowerCase().trim()
+                (r) => !r.managed && (
+                  r.name.toLowerCase().trim() === rName.toLowerCase().trim() ||
+                  (rDef.key === 'class_representative' && r.name.toLowerCase().trim() === 'class rep')
+                )
               );
               if (!gRole) continue;
 
@@ -904,15 +1614,33 @@ module.exports = {
 
               if (shouldHave && !member.roles.cache.has(gRole.id)) {
                 await member.roles.add(gRole).catch(() => {});
+                console.log(`[syncUserAcrossGuilds] Added chapter role "${gRole.name}" to ${member.user.tag}`);
               } else if (!shouldHave && member.roles.cache.has(gRole.id)) {
-                // Remove outdated role
                 await member.roles.remove(gRole).catch(() => {});
+                console.log(`[syncUserAcrossGuilds] Removed chapter role "${gRole.name}" from ${member.user.tag}`);
               }
             }
 
             // Trigger welcome card if new verified member
             const { postVerificationWelcomeCard } = require('./generateWelcomeCard');
             await postVerificationWelcomeCard(guild, member, profile.full_name);
+          } else {
+            // Unlinked member in chapter server
+            if (verifiedRole && member.roles.cache.has(verifiedRole.id)) {
+              await member.roles.remove(verifiedRole).catch(() => {});
+            }
+            if (unverifiedRole && !member.roles.cache.has(unverifiedRole.id)) {
+              await member.roles.add(unverifiedRole).catch(() => {});
+            }
+            const allRoles = await this.getAllOsRoles();
+            for (const rDef of allRoles) {
+              const gRole = guild.roles.cache.find(
+                (r) => !r.managed && r.name.toLowerCase().trim() === (rDef.name || rDef.key).toLowerCase().trim()
+              );
+              if (gRole && member.roles.cache.has(gRole.id)) {
+                await member.roles.remove(gRole).catch(() => {});
+              }
+            }
           }
           continue;
         }
@@ -924,7 +1652,7 @@ module.exports = {
           for (const rDef of allRoles) {
             const rName = rDef.name || rDef.key;
             const gRole = guild.roles.cache.find(
-              (r) => r.name.toLowerCase().trim() === rName.toLowerCase().trim()
+              (r) => !r.managed && r.name.toLowerCase().trim() === rName.toLowerCase().trim()
             );
             if (gRole && member.roles.cache.has(gRole.id)) {
               await member.roles.remove(gRole).catch(() => {});

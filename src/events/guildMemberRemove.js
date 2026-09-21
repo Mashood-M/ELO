@@ -22,6 +22,6 @@ module.exports = {
     api.logChapterEvent(member.client, guildConfig.chapterId, member.guild.id, 'leave', {
       username: member.user.tag,
       discord_user_id: member.id,
-    }).catch(() => {});
+    }, 'membership').catch(() => {});
   },
 };

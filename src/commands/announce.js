@@ -60,7 +60,7 @@ module.exports = {
         channelId: targetChannel.id,
         channelName: targetChannel.name,
         by: interaction.user.tag,
-      }).catch(() => {});
+      }, 'channel_role_changes').catch(() => {});
     } catch (err) {
       console.error('[announce] Error broadcasting message:', err);
       await interaction.reply({

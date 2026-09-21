@@ -5,16 +5,16 @@ const verifyFlow = require('../lib/verifyFlow');
 module.exports = {
   name: Events.InteractionCreate,
   async execute(interaction) {
-    // 1. Slash commands
-    if (interaction.isChatInputCommand()) {
+    // 1. Slash commands & Context Menu commands
+    if (interaction.isChatInputCommand() || interaction.isContextMenuCommand()) {
       const command = interaction.client.commands.get(interaction.commandName);
       if (!command) return;
 
       try {
         await command.execute(interaction);
       } catch (err) {
-        console.error(`Error running /${interaction.commandName}:`, err);
-        const payload = { content: 'Something went wrong running that command.', flags: [1 << 6] };
+        console.error(`Error running ${interaction.commandName}:`, err);
+        const payload = { content: 'Something went wrong running that command.', ephemeral: true };
         if (interaction.deferred && !interaction.replied) {
           await interaction.editReply(payload).catch(() => {});
         } else if (interaction.replied) {

@@ -23,7 +23,7 @@ module.exports = {
   async execute(interaction) {
     if (!(await checkCommandPermission(interaction, 'mute'))) return;
 
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true });
 
     const target = interaction.options.getMember('member');
     const durationStr = interaction.options.getString('duration');
@@ -75,6 +75,6 @@ module.exports = {
       durationStr,
       reason,
       by: interaction.user.tag,
-    }).catch(() => {});
+    }, 'moderation').catch(() => {});
   },
 };

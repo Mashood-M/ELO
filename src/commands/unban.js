@@ -12,7 +12,7 @@ module.exports = {
   async execute(interaction) {
     if (!(await checkCommandPermission(interaction, 'unban'))) return;
 
-    await interaction.deferReply();
+    await interaction.deferReply({ ephemeral: true });
 
     const userId = interaction.options.getString('user_id');
 
@@ -39,6 +39,6 @@ module.exports = {
     api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'unban', {
       userId,
       by: interaction.user.tag,
-    }).catch(() => {});
+    }, 'moderation').catch(() => {});
   },
 };

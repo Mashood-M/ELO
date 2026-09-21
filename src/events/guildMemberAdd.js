@@ -27,7 +27,7 @@ module.exports = {
           username: member.user.tag,
           discord_user_id: member.id,
           name: identity.name,
-        }).catch(() => {});
+        }, 'membership').catch(() => {});
         return;
       }
 
@@ -61,7 +61,7 @@ module.exports = {
         api.logChapterEvent(member.client, guildConfig.chapterId, guild.id, 'join_unverified', {
           username: member.user.tag,
           discord_user_id: member.id,
-        }).catch(() => {});
+        }, 'membership').catch(() => {});
       } else {
         // Main server join
         const generalChannel = guild.channels.cache.find((c) => c.name === 'general-chat' || c.name === 'general');

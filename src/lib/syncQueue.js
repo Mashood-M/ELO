@@ -23,8 +23,8 @@ class SyncQueue {
    */
   enqueue(type, id, taskFn, attempt = 1) {
     const key = `${type}:${id}`;
-    if (this.pendingSet.has(key) || this.inFlightSet.has(key)) {
-      return; // Already pending or actively executing in queue
+    if (this.pendingSet.has(key)) {
+      return; // Already pending in queue to execute next
     }
 
     this.pendingSet.add(key);

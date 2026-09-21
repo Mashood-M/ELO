@@ -2,6 +2,24 @@ const { ChannelType, PermissionFlagsBits } = require('discord.js');
 const supabase = require('./supabase');
 const api = require('./api');
 const syncQueue = require('./syncQueue');
+const config = require('../config');
+
+// Fixed generic emoji set for clusters (deterministic mapping, no OS changes)
+const CLUSTER_EMOJIS = ['🧠', '📦', '🔧', '🎯', '📡', '🛡️', '🚀', '💡'];
+
+/**
+ * Deterministically pick an emoji from CLUSTER_EMOJIS based on cluster id or name.
+ */
+function getClusterEmoji(cluster) {
+  const seed = String(cluster?.id || cluster?.name || 'cluster');
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) {
+    hash = ((hash << 5) - hash) + seed.charCodeAt(i);
+    hash |= 0;
+  }
+  const index = Math.abs(hash) % CLUSTER_EMOJIS.length;
+  return CLUSTER_EMOJIS[index];
+}
 
 /**
  * Normalizes a channel name according to Discord rules (lowercase, hyphens, alphanumeric).
@@ -90,15 +108,34 @@ async function syncCluster(client, clusterId) {
       });
     }
 
-    // 5. Create or find Private Category
-    // Category name e.g. "Product Design" or "📁 Product Design"
+    // 5. Create or find Campus Lead Role to grant category access
+    const campusLeadRoleName = config.roles.campusLead || 'Campus Lead';
+    let campusLeadRole = guild.roles.cache.find(
+      (r) => r.name.toLowerCase().trim() === campusLeadRoleName.toLowerCase().trim()
+    );
+    if (!campusLeadRole) {
+      campusLeadRole = await guild.roles.create({
+        name: campusLeadRoleName,
+        color: 0xF59E0B,
+        reason: 'ElevatesOS Campus Lead Role',
+      }).catch(() => null);
+    }
+
+    // 6. Create or find Private Category
+    // Category name format: "<emoji>・<CLUSTER NAME IN UPPERCASE>" (e.g. "🛡️・CYBERSECURITY")
+    const clusterEmoji = getClusterEmoji(cluster);
+    const categoryName = `${clusterEmoji}・${clusterName.toUpperCase()}`;
+
     let category = guild.channels.cache.find(
       (c) =>
         c.type === ChannelType.GuildCategory &&
-        c.name.toLowerCase().replace(/[^a-z0-9]/g, '') === clusterName.toLowerCase().replace(/[^a-z0-9]/g, '')
+        (
+          c.name.trim().toLowerCase() === categoryName.trim().toLowerCase() ||
+          c.name.toLowerCase().replace(/[^a-z0-9]/g, '') === clusterName.toLowerCase().replace(/[^a-z0-9]/g, '')
+        )
     );
 
-    // Permissions: default-deny @everyone, allow member role, allow host role with specific management perms
+    // Permissions: default-deny @everyone, allow bot, allow member role, allow host role, allow campus lead role
     const permissionOverwrites = [
       {
         id: guild.roles.everyone.id,
@@ -128,6 +165,22 @@ async function syncCluster(client, clusterId) {
       },
     ];
 
+    // Campus Lead access: grant the chapter's Campus Lead role View Channel + Send Messages on cluster category
+    if (campusLeadRole) {
+      permissionOverwrites.push({
+        id: campusLeadRole.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.AttachFiles,
+          PermissionFlagsBits.EmbedLinks,
+          PermissionFlagsBits.Connect,
+          PermissionFlagsBits.Speak,
+        ],
+      });
+    }
+
     if (hostRole) {
       // Host permissions scoped to this category ONLY:
       // Manage messages, pin messages, manage voice channel. NOT server-wide kick/ban.
@@ -151,65 +204,129 @@ async function syncCluster(client, clusterId) {
 
     if (!category) {
       category = await guild.channels.create({
-        name: clusterName,
+        name: categoryName,
         type: ChannelType.GuildCategory,
         permissionOverwrites,
         reason: `Private category for cluster: ${clusterName}`,
       });
     } else {
-      // Sync permissions on category to ensure member & host roles have access
-      await category.permissionOverwrites.set(permissionOverwrites).catch(() => {});
+      // Update name to new emoji format if needed
+      if (category.name !== categoryName) {
+        await category.setName(categoryName).catch(() => {});
+      }
+      // Sync permissions on category to ensure member, host, and campus lead roles have access
+      await category.permissionOverwrites.set(permissionOverwrites).catch((err) => {
+        console.warn(`[clusterSync] Could not set category overwrites for ${clusterName}:`, err.message);
+      });
     }
 
-    // 6. Ensure all 5 required channels exist inside the private category
-    // 1) Discussion/doubt-clearing
-    // 2) Resources
-    // 3) Challenges/tasks
-    // 4) Projects
-    // 5) Live sessions (voice)
-
+    // 7. Ensure all 6 required channels exist inside the private category:
+    // - #announcements → Announcement channel type
+    // - #discussion → Forum channel type
+    // - #resources → Forum channel type
+    // - #challenges → Forum channel type
+    // - #projects → Forum channel type
+    // - #cluster-room → Voice channel
     const expectedChannels = [
       {
-        name: 'discussion-and-doubts',
-        type: ChannelType.GuildText,
+        name: 'announcements',
+        type: ChannelType.GuildAnnouncement,
+        topic: `${clusterName} • Official announcements and cluster updates.`,
+        fallbackType: ChannelType.GuildText,
+      },
+      {
+        name: 'discussion',
+        type: ChannelType.GuildForum,
         topic: `${clusterName} • Open discussion, questions, and doubt-clearing.`,
+        fallbackType: ChannelType.GuildText,
       },
       {
         name: 'resources',
-        type: ChannelType.GuildText,
+        type: ChannelType.GuildForum,
         topic: `${clusterName} • Curated learning materials, docs, and resources.`,
+        fallbackType: ChannelType.GuildText,
       },
       {
-        name: 'challenges-and-tasks',
-        type: ChannelType.GuildText,
-        topic: `${clusterName} • Weekly challenges, milestones, and task checklists.`,
+        name: 'challenges',
+        type: ChannelType.GuildForum,
+        topic: `${clusterName} • Weekly challenges, milestones, and task submissions.`,
+        fallbackType: ChannelType.GuildText,
       },
       {
         name: 'projects',
-        type: ChannelType.GuildText,
+        type: ChannelType.GuildForum,
         topic: `${clusterName} • Showcase projects, demos, and collaborate.`,
+        fallbackType: ChannelType.GuildText,
       },
       {
-        name: '🔊 Live Sessions',
+        name: 'cluster-room',
         type: ChannelType.GuildVoice,
       },
     ];
 
+    const channelMap = {};
+
     for (const spec of expectedChannels) {
-      const existing = guild.channels.cache.find(
+      let existing = guild.channels.cache.find(
         (c) => c.parentId === category.id && c.name.toLowerCase() === spec.name.toLowerCase()
       );
 
       if (!existing) {
-        await guild.channels.create({
-          name: spec.name,
-          type: spec.type,
-          parent: category.id,
-          topic: spec.topic || undefined,
-          reason: `Cluster channel for ${clusterName}`,
-        });
+        try {
+          existing = await guild.channels.create({
+            name: spec.name,
+            type: spec.type,
+            parent: category.id,
+            topic: spec.topic || undefined,
+            reason: `Cluster channel for ${clusterName}`,
+          });
+        } catch (createErr) {
+          // Fallback if guild does not have COMMUNITY feature enabled
+          if (spec.fallbackType) {
+            console.warn(`[clusterSync] Failed to create ${spec.name} as type ${spec.type}, attempting fallback to ${spec.fallbackType}:`, createErr.message);
+            existing = await guild.channels.create({
+              name: spec.name,
+              type: spec.fallbackType,
+              parent: category.id,
+              topic: spec.topic || undefined,
+              reason: `Cluster channel fallback for ${clusterName}`,
+            }).catch((err) => {
+              console.error(`[clusterSync] Failed fallback creation for ${spec.name}:`, err.message);
+              return null;
+            });
+          } else {
+            console.error(`[clusterSync] Failed to create channel ${spec.name}:`, createErr.message);
+          }
+        }
+      }
+
+      if (existing) {
+        channelMap[spec.name] = existing.id;
       }
     }
+
+    // Persist Discord mappings for this cluster
+    await supabase
+      .from('cluster_discord_mappings')
+      .upsert(
+        {
+          cluster_id: cluster.id,
+          guild_id: guild.id,
+          category_id: category.id,
+          member_role_id: memberRole.id,
+          host_role_id: hostRole ? hostRole.id : null,
+          discussion_channel_id: channelMap['discussion'] || null,
+          resources_channel_id: channelMap['resources'] || null,
+          challenges_channel_id: channelMap['challenges'] || null,
+          projects_channel_id: channelMap['projects'] || null,
+          voice_channel_id: channelMap['cluster-room'] || null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'cluster_id,guild_id' }
+      )
+      .catch((err) => {
+        console.warn(`[clusterSync] Could not upsert cluster_discord_mappings for ${cluster.id}:`, err?.message);
+      });
 
     // 7. Synchronize Cluster Membership
     // Read member user IDs from cluster_members table and cluster.member_ids array
@@ -269,6 +386,12 @@ async function syncCluster(client, clusterId) {
             (await guild.members.fetch(discordId).catch(() => null));
           if (member && !member.roles.cache.has(memberRole.id)) {
             await member.roles.add(memberRole);
+            api.logChapterEvent(client, cluster.chapter_id, guild.id, 'cluster_member_added', {
+              clusterName,
+              clusterId: cluster.id,
+              discord_user_id: discordId,
+              memberTag: member.user?.tag,
+            }).catch(() => {});
           }
         } catch (_) {}
       }
@@ -277,6 +400,12 @@ async function syncCluster(client, clusterId) {
       for (const [, member] of guild.members.cache) {
         if (member.roles.cache.has(memberRole.id) && !linkedDiscordUserIds.has(member.id)) {
           await member.roles.remove(memberRole).catch(() => {});
+          api.logChapterEvent(client, cluster.chapter_id, guild.id, 'cluster_member_removed', {
+            clusterName,
+            clusterId: cluster.id,
+            discord_user_id: member.id,
+            memberTag: member.user?.tag,
+          }).catch(() => {});
         }
       }
 
@@ -287,6 +416,12 @@ async function syncCluster(client, clusterId) {
             (await guild.members.fetch(hostDiscordUserId).catch(() => null));
           if (hostMember && !hostMember.roles.cache.has(hostRole.id)) {
             await hostMember.roles.add(hostRole).catch(() => {});
+            api.logChapterEvent(client, cluster.chapter_id, guild.id, 'cluster_host_assigned', {
+              clusterName,
+              clusterId: cluster.id,
+              discord_user_id: hostDiscordUserId,
+              hostTag: hostMember.user?.tag,
+            }).catch(() => {});
           }
         }
 
@@ -294,6 +429,12 @@ async function syncCluster(client, clusterId) {
         for (const [, member] of guild.members.cache) {
           if (member.roles.cache.has(hostRole.id) && member.id !== hostDiscordUserId) {
             await member.roles.remove(hostRole).catch(() => {});
+            api.logChapterEvent(client, cluster.chapter_id, guild.id, 'cluster_host_removed', {
+              clusterName,
+              clusterId: cluster.id,
+              discord_user_id: member.id,
+              hostTag: member.user?.tag,
+            }).catch(() => {});
           }
         }
       }
@@ -306,9 +447,16 @@ async function syncCluster(client, clusterId) {
 /**
  * Synchronizes all clusters for a given chapter.
  */
-async function syncChapterClusters(client, chapterId) {
-  if (!client || !chapterId) return;
+async function syncChapterClusters(client, chapterIdOrIdentifier) {
+  if (!client || !chapterIdOrIdentifier) return;
   try {
+    const api = require('./api');
+    let chapterId = chapterIdOrIdentifier;
+    const chapter = await api.getChapterByIdentifier(chapterIdOrIdentifier);
+    if (chapter) {
+      chapterId = chapter.id;
+    }
+
     const { data: clusters, error } = await supabase
       .from('clusters')
       .select('id')

@@ -152,13 +152,26 @@ async function canUserExecuteCommand(discordUserId, guildId, commandName, member
       };
     }
 
-    // Check user's chapter assignment: MUST match this chapter's ID!
+    // Check user's chapter assignment: supports UUID or Elevates ID (e.g. CHP-0033)
     const userChapterId = profile.chapter_id;
+    const guildElevatesId = guildConfig?.chapterElevatesId || guildConfig?.elevates_id;
+    const isDirectLead =
+      guildConfig?.campusLeadId === profile.id ||
+      guildConfig?.campus_lead_id === profile.id ||
+      guildConfig?.campusLeadDiscordId === discordUserId ||
+      guildConfig?.campus_lead_discord_id === discordUserId;
+
+    const isChapterMatch =
+      userChapterId === guildChapterId ||
+      (guildElevatesId && userChapterId && userChapterId.toLowerCase() === guildElevatesId.toLowerCase());
+
     const hasChapterRoleInThisChapter = userRoles.some(
-      (r) => r.chapter_id === guildChapterId
+      (r) =>
+        r.chapter_id === guildChapterId ||
+        (guildElevatesId && r.chapter_id && r.chapter_id.toLowerCase() === guildElevatesId.toLowerCase())
     );
 
-    if (userChapterId !== guildChapterId && !hasChapterRoleInThisChapter) {
+    if (!isChapterMatch && !hasChapterRoleInThisChapter && !isDirectLead) {
       return {
         allowed: false,
         reason: 'You are not a registered member of this chapter.',
@@ -170,13 +183,22 @@ async function canUserExecuteCommand(discordUserId, guildId, commandName, member
     // Extract roles held SPECIFICALLY in this chapter
     const chapterRoleKeys = new Set(
       userRoles
-        .filter((r) => r.chapter_id === guildChapterId || !r.chapter_id)
+        .filter(
+          (r) =>
+            r.chapter_id === guildChapterId ||
+            (guildElevatesId && r.chapter_id && r.chapter_id.toLowerCase() === guildElevatesId.toLowerCase()) ||
+            !r.chapter_id
+        )
         .map((r) => (r.role_key || r.role || '').toLowerCase().trim())
     );
 
-    if (profile.chapter_id === guildChapterId) {
+    if (isChapterMatch) {
       if (profile.designation) chapterRoleKeys.add(profile.designation.toLowerCase().trim());
       if (profile.role) chapterRoleKeys.add(profile.role.toLowerCase().trim());
+    }
+
+    if (isDirectLead) {
+      chapterRoleKeys.add('campus_lead');
     }
 
     // Check permissions in chapter server
@@ -225,10 +247,22 @@ async function checkCommandPermission(interaction, commandName) {
   if (!result.allowed) {
     const errorMsg = result.reason || "You don't have permission to use this command.";
     if (interaction.deferred) {
-      await interaction.editReply({ content: `⚠️ ${errorMsg}`, flags: [1 << 6] }).catch(() => {});
+      await interaction.editReply({ content: `⚠️ ${errorMsg}` }).catch(() => {});
     } else {
       await interaction.reply({ content: `⚠️ ${errorMsg}`, ephemeral: true }).catch(() => {});
     }
+
+    try {
+      const api = require('./api');
+      const guildConfig = interaction.guildId ? await api.getGuildConfig(interaction.guildId).catch(() => null) : null;
+      api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guildId, 'command_permission_denied', {
+        command: commandName,
+        userId: interaction.user.id,
+        userTag: interaction.user.tag,
+        reason: errorMsg,
+      }, 'moderation').catch(() => {});
+    } catch (_) {}
+
     return false;
   }
 

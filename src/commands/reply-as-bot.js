@@ -61,7 +61,7 @@ module.exports = {
         targetMessageId: messageId,
         channelId: interaction.channel.id,
         by: interaction.user.tag,
-      }).catch(() => {});
+      }, 'channel_role_changes').catch(() => {});
     } catch (err) {
       console.error('[reply-as-bot] Error replying to message:', err);
       await interaction.reply({

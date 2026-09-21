@@ -1,3 +1,6 @@
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const fs = require('fs');
 const path = require('path');
 const { Client, GatewayIntentBits, Partials, Collection, Events } = require('discord.js');
@@ -34,10 +37,14 @@ for (const file of fs.readdirSync(eventsPath).filter((f) => f.endsWith('.js'))) 
 }
 
 const { initRealtimeSync } = require('./lib/realtime');
+const { startServer } = require('./server');
+const { checkMainGuildRoleSanity } = require('./lib/roleSanityCheck');
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}. Serving ${client.guilds.cache.size} guild(s).`);
+  await checkMainGuildRoleSanity(client);
   initRealtimeSync(client);
+  startServer(client);
 });
 
 client.login(config.token);
