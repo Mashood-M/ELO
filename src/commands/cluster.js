@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
+const { SlashCommandBuilder, EmbedBuilder, MessageFlags } = require('discord.js');
 const api = require('../lib/api');
 
 module.exports = {
@@ -7,7 +7,7 @@ module.exports = {
     .setDescription('Show the linked member count and list for this chapter.'),
 
   async execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     let guildConfig;
     try {

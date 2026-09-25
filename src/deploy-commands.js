@@ -22,10 +22,11 @@ const rest = new REST().setToken(config.token);
 
 async function deploy() {
   try {
-    console.log('\n--- Step 1: Cleaning Up Global Commands ---');
-    console.log('Wiping all global application commands to prevent duplicate command listings in Discord...');
-    await rest.put(Routes.applicationCommands(config.clientId), { body: [] });
-    console.log('✓ Successfully cleared all global commands (0 global commands active).');
+    console.log('\n--- Step 1: Deploying Global DM Commands ---');
+    console.log('Deploying global application commands (/ticket, /connect, /verify) for direct message accessibility...');
+    const globalCommands = commands.filter((c) => ['ticket', 'connect', 'verify'].includes(c.name));
+    await rest.put(Routes.applicationCommands(config.clientId), { body: globalCommands });
+    console.log(`✓ Successfully deployed ${globalCommands.length} global command(s) for DM access: [${globalCommands.map((c) => c.name).join(', ')}]`);
 
     console.log('\n--- Step 2: Resolving Target Guilds for Guild-Specific Registration ---');
     const targetGuildIds = new Set();
@@ -79,9 +80,18 @@ async function deploy() {
   }
 }
 
+async function deployToGuild(guildId) {
+  if (!guildId) return [];
+  const restClient = new REST().setToken(config.token);
+  return restClient.put(
+    Routes.applicationGuildCommands(config.clientId, guildId),
+    { body: commands }
+  );
+}
+
 if (require.main === module) {
   deploy();
 }
 
-module.exports = { deploy };
+module.exports = { deploy, deployToGuild };
 

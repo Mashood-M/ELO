@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { SlashCommandBuilder, PermissionFlagsBits, MessageFlags } = require('discord.js');
 const api = require('../lib/api');
 const { checkCommandPermission } = require('../lib/permissions');
 const config = require('../config');
@@ -12,9 +12,9 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
 
   async execute(interaction) {
-    if (!(await checkCommandPermission(interaction, 'kick'))) return;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    await interaction.deferReply({ ephemeral: true });
+    if (!(await checkCommandPermission(interaction, 'kick'))) return;
 
     const target = interaction.options.getMember('member');
     const reason = interaction.options.getString('reason') || 'No reason given';
@@ -57,6 +57,7 @@ module.exports = {
       targetTag: target.user.tag,
       reason,
       by: interaction.user.tag,
+      by_id: interaction.user.id,
     }, 'moderation').catch(() => {});
   },
 };

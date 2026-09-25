@@ -53,29 +53,119 @@ The bot communicates directly with Supabase via the service-role key (no interme
     *"⚠️ This chapter server has not been activated yet. Your Campus Lead must generate an activation link using `/chapter` in the Elevates Main Server."*
 
 ### 4. Forum-Based Audit Logging Structure
-- **Founders Oversight in Main Server**: Upon chapter server activation, the bot establishes a dedicated **Forum channel** per chapter (`#chp-<chapter-slug>`) inside the `Chapter Management` category, permissioned exclusively for Founders and HQ Admins.
-- **Auto-Created Starter Log Threads**: On forum creation, the bot automatically spins up 4 distinct starter threads and persists their thread IDs in `chapter_log_channels`:
-  - `🛡️ Moderation`: Moderation actions including kicks, bans, unbans, mutes, warnings, and unlinks.
+- **Founders Oversight in Main Server**: Upon chapter server activation, the bot establishes a dedicated **Forum channel** per chapter (`#chp-<chapter-slug>`) inside the `CHAPTER LOGS 🔒` category, permissioned exclusively for Founders and HQ Admins.
+- **Auto-Created Starter Log Threads**: On forum creation, the bot automatically spins up 8 distinct starter threads:
+  - `🛡️ Moderation`: Moderation actions including kicks, bans, unbans, mutes/timeouts, warnings, unlinks, and message purge (/clear).
+  - `💬 Discord Activity`: Real-time Discord server events including deleted messages, message edits, voice channel join/leave/switch, and server invites.
+  - `⚙️ Channel & Role Changes`: Chapter activation notices, channel/role creations, updates, and deletions.
+  - `🎭 Role Changes`: ElevatesOS role assignments, promotions, demotions, and permission updates.
+  - `👥 Current Roles`: Live synchronized roster of all current chapter leads, core team, and role holders.
+  - `📅 Events & Meetups`: Event creation, schedule updates, attendance check-ins, and form releases.
   - `🧠 Cluster Activity`: Cluster lifecycle events, member role additions/removals, and host assignments.
-  - `⚙️ Channel & Role Changes`: Chapter activation notices, channel/role creations and updates, broadcasts.
-  - `👤 Membership`: Member join events (verified and unverified), server leaves, and account linking updates.
-- **Centralized Event Router**: `api.logChapterEvent` automatically maps event types and routes embeds into the appropriate category thread.
+  - `👤 Membership`: Member join events (verified and unverified), server leaves, account linking updates, and nickname changes.
+- **Centralized Event Router**: `api.logChapterEvent` automatically maps event types and routes rich embed notifications into the appropriate chapter thread in the Main Server and to the local server's `#mod-log`.
 
-### 5. Private Chapter Clusters & Corrected Channel Types
-- Scoped to chapters via `clusters` and `cluster_members` tables.
-- **Deterministic Category Naming**: Formatted as `<emoji>・<CLUSTER NAME IN UPPERCASE>` (e.g. `🛡️・CYBERSECURITY`). Deterministically hashes the cluster's unique ID/name against a fixed emoji array (`🧠`, `📦`, `🔧`, `🎯`, `📡`, `🛡️`, `🚀`, `💡`), guaranteeing consistency across resyncs without modifying the OS schema.
-- **Automatic Campus Lead Access**: Whenever a cluster is created or synced, the chapter's **Campus Lead** role is explicitly granted `View Channel` and `Send Messages` overwrites on the cluster category, providing seamless oversight without per-user manual grants.
-- **Exact Discord Channel Types**:
-  1. `#announcements` → **Announcement channel** (`ChannelType.GuildAnnouncement`)
-  2. `#discussion` → **Forum channel** (`ChannelType.GuildForum`)
-  3. `#resources` → **Forum channel** (`ChannelType.GuildForum`)
-  4. `#challenges` → **Forum channel** (`ChannelType.GuildForum`)
-  5. `#projects` → **Forum channel** (`ChannelType.GuildForum`)
-  6. `#cluster-room` → **Voice channel** (`ChannelType.GuildVoice`)
-- **Role Scoping**:
-  - `<Cluster Name> Member`: Grants access to the cluster's category and channels.
-  - `<Cluster Name> Host`: Scoped strictly to the cluster's category (manage messages, manage tasks; zero server-wide moderation power).
-- **Persistent Channel Mappings**: Stored in `cluster_discord_mappings` table for rapid lookups by the task engine.
+### 5. Production-Grade Cluster Synchronization System
+The bot features a complete, resilient synchronization engine between Supabase and Discord for chapter clusters:
+
+#### Database Schema
+- **`clusters`** (extended):
+  - `discord_category_id` (TEXT, nullable): ID of the private Discord category.
+  - `discord_role_id` (TEXT, nullable): ID of the cluster member Discord role.
+- **`cluster_members`** (membership & roles):
+  - `id` (UUID PK): Unique membership identifier.
+  - `cluster_id` (UUID FK -> `clusters`): Target cluster.
+  - `user_id` (UUID FK -> `profiles`): Target user profile.
+  - `added_by` (UUID FK -> `profiles`, nullable): Profile that added the member.
+  - `added_at` (TIMESTAMPTZ): Timestamp when member was added.
+  - `role_in_cluster` (TEXT, `'member'` | `'host'`): Role within the cluster.
+- **`pending_discord_roles`** (deferred role assignment):
+  - `id` (UUID PK): Unique pending role identifier.
+  - `user_id` (UUID FK -> `profiles`): User awaiting role assignment.
+  - `role_type` (TEXT, `'cluster_member'` | `'cluster_host'` | `'chapter_role'`): Target role type.
+  - `target_id` (UUID): Cluster ID or Chapter ID.
+  - `created_at` (TIMESTAMPTZ): Timestamp queued.
+- **`discord_sync_log`** (audit trail):
+  - `id` (UUID PK): Unique log identifier.
+  - `event_type` (TEXT): Event name (e.g. `cluster_created`, `cluster_member_added`, `cluster_member_removed`, `pending_role_resolved`, `cluster_archived`, `reconciliation_drift_corrected`).
+  - `user_id` (UUID nullable): Associated profile ID.
+  - `cluster_id` (UUID nullable): Associated cluster ID.
+  - `discord_role_id` (TEXT nullable): Role ID impacted.
+  - `action` (TEXT, `'granted'` | `'revoked'` | `'created'` | `'archived'`): Action executed.
+  - `success` (BOOLEAN): Whether the operation succeeded.
+  - `error_message` (TEXT nullable): Error details if operation failed.
+  - `created_at` (TIMESTAMPTZ): Audit timestamp.
+
+#### Event Flow & Lifecycle
+
+```
+[Supabase Event]
+       │
+       ├── clusters (INSERT) ──────────► handleClusterCreated
+       │                                     1. Create '<Name> Member' role
+       │                                     2. Immediately UPDATE clusters.discord_role_id
+       │                                     3. Create private category with permission overwrites
+       │                                     4. Create child channels (#announcements, #discussion, #resources, #challenges, #projects, Voice)
+       │                                     5. UPDATE clusters.discord_category_id & log to discord_sync_log
+       │
+       ├── clusters (UPDATE: archived) ─► handleClusterArchived
+       │                                     1. Rename category to '[ARCHIVED] <Name>'
+       │                                     2. Reject auto-assignment for new members
+       │                                     3. Preserve channels & roles for 30-day grace period
+       │
+       ├── cluster_members (INSERT) ───► handleMemberAdded
+       │                                     ├── Cluster archived? ──► Reject & log invalid
+       │                                     ├── User linked & in guild? ──► Grant role (idempotent)
+       │                                     └── Not linked or not in guild? ──► INSERT into pending_discord_roles
+       │
+       ├── cluster_members (DELETE) ───► handleMemberRemoved
+       │                                     1. Revoke Discord role if held
+       │                                     2. CRITICAL: DELETE matching pending_discord_roles row
+       │                                     3. Log revocation outcome
+       │
+       └── discord_links (INSERT/linked) ► handleUserLinked
+                                             1. Query pending_discord_roles for user
+                                             2. For each pending role (isolated try/catch):
+                                                - If cluster archived/deleted: skip & delete pending row
+                                                - If member in guild: grant role & delete pending row
+                                                - Log outcome to discord_sync_log
+```
+
+#### Rate Limiting & Backoff (`SyncQueue`)
+- Every Discord API call (role creation, assignment, category/channel provisioning, renaming) is routed through `syncQueue.enqueueAsync(...)`.
+- Automatic HTTP 429 rate limit backoff uses Discord's `retry_after` headers.
+- Sequential pacing (`250ms` spacing) and exponential retry backoff (up to 4 attempts) ensure zero unhandled rate-limit drops.
+- Role assignments check `member.roles.cache.has(roleId)` first to skip redundant API requests.
+
+#### Role Reconciliation & Drift Correction
+A built-in reconciliation engine compares `cluster_members` in Supabase against actual Discord role holders in that cluster's role:
+- **Grants missing roles**: Members linked in Supabase who do not currently hold the cluster role.
+- **Revokes excess roles**: Discord members holding the cluster role who are no longer in `cluster_members`.
+- **Logs all corrections**: Every drift correction is audited in `discord_sync_log` under `reconciliation_drift_corrected`.
+
+##### Triggering Reconciliation Manually
+Run the reconciliation script from the command line:
+```bash
+# Reconcile all active clusters across all chapters
+node scripts/reconcile-clusters.js
+
+# Reconcile a specific cluster by ID
+node scripts/reconcile-clusters.js --cluster <cluster-uuid>
+
+# Preview drift without executing changes (dry run)
+node scripts/reconcile-clusters.js --dry-run
+```
+
+Programmatic execution is also available via `clusterSync`:
+```javascript
+const { reconcileClusterMembers, reconcileAllClusters } = require('./src/lib/clusterSync');
+
+// Reconcile single cluster
+await reconcileClusterMembers(client, clusterId);
+
+// Reconcile all active clusters
+await reconcileAllClusters(client);
+```
 
 ### 6. Cluster Weekly Tasks Engine
 - **Supabase Tables (`20260919000000_cluster_tasks.sql`)**:
@@ -104,11 +194,24 @@ Permissions are enforced using an OS-driven permission matrix (`src/lib/permissi
 | **Class Representative** | None | Moderation: `/kick`, `/mute`, `/warn`, `/warnings` (no ban/unban/unlink) |
 | **Student Member** | None | Member commands: `/cluster` |
 
-### 8. Preserved Features
+### 8. Two-Way DM Support & Modmail System
+- **Private Staff Forum (`#user-dm-support`)**: Auto-created in the Main Server, visible strictly to Founders, HQ Admins, and the bot.
+- **Permanent Mailbox Threads**: Direct messages sent to the bot (excluding active account verification sessions) automatically route into a dedicated, permanent forum thread titled with the member's Discord and ElevatesOS name.
+- **Database Tracking (`dm_threads`)**: Maps each `discord_user_id` to their permanent `forum_thread_id` and tracks conversation status (`open` | `closed`).
+- **Two-Way Relaying**:
+  - Staff (Founders & HQ Admins) reply directly inside the support thread; the bot immediately relays their message (and attachments) to the user via DM prefixed as `**Elevates Support Team:**\n<message content>`.
+  - Non-staff replies are rejected with `❌` and an authorization warning.
+  - Delivery failures (e.g. user DMs closed or no mutual server) react with `⚠️` and post `"Couldn't deliver this to the user — they may have DMs disabled."`.
+  - Successful deliveries react with `✅`.
+- **Conversation Lifecycle**:
+  - Staff can close a resolved ticket using the **"Close Ticket"** message context menu, `/close-ticket` slash command, or `!close` text command. This marks status as `'closed'`, archives the Discord thread, and sends a resolution note to the user.
+  - Future DMs from that user automatically unarchive and reopen the existing thread with a `🔄 Conversation reopened` notice rather than creating duplicates.
+- **First-Message Welcome**: Only the first message of a new or reopened conversation sends an automated acknowledgment to avoid repetitive spam.
+
+### 9. Preserved Features
 - **`/cluster`**: Displays member count and directory of linked chapter members.
 - **`/create-cluster`**: Opens public discussion forum threads in the Main Server.
 - **Welcome Card Generation**: 800x300 canvas image generated and posted to `#general-chat` upon account verification.
-- **DM-to-Staff Forwarding**: Inquiries sent to the bot via DM are forwarded to `#bot-commands` in the Main Server.
 - **Unverified Member Nudges**: Alerts unverified members who post in public channels, directing them to `#link-server`.
 - **Admin Broadcasts**: `/announce` and `/reply-as-bot` with OS role-based permission checks.
 
@@ -140,6 +243,11 @@ Permissions are enforced using an OS-driven permission matrix (`src/lib/permissi
    - `20260917000000_discord_verification_codes.sql`
    - `20260918000000_restructure_sync_and_provisioning.sql`
    - `20260919000000_cluster_tasks.sql`
+   - `20260920000000_chapter_log_threads.sql`
+   - `20260921000000_dm_support_threads.sql`
+   - `20260924000000_discord_tickets.sql`
+   - `20260925000000_term_handover_logs.sql`
+   - `20260925010000_cluster_sync_system.sql`
 
 4. **Register Commands & Context Menus:**
    ```bash
@@ -172,3 +280,6 @@ Permissions are enforced using an OS-driven permission matrix (`src/lib/permissi
 | `/unlink <member>` | Slash | Chapter Server | Campus Lead, Founder | Force-unlinks an account from ElevatesOS |
 | `/announce <channel> <message>` | Slash | Chapter / Main | Campus Lead (chapter), Founder | Broadcasts an announcement |
 | `/reply-as-bot <msg_id> <text>` | Slash | Chapter / Main | Campus Lead (chapter), Founder | Replies to a channel message as the bot |
+| `/clear <password> [amount] [user]` | Slash | Any Server | Password Authorized (`mashood`) | Bulk deletes messages in the current channel |
+| **Close Ticket** | Message App | Support Thread | Lane Authorized Staff | Closes and archives the user support ticket |
+| `/close-ticket` | Slash | Support Thread | Lane Authorized Staff | Closes and archives the user support ticket |

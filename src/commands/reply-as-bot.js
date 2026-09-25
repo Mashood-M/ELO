@@ -1,6 +1,7 @@
 const {
   SlashCommandBuilder,
   PermissionFlagsBits,
+  MessageFlags,
 } = require('discord.js');
 const config = require('../config');
 const api = require('../lib/api');
@@ -25,10 +26,11 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 
   async execute(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
     if (!config.features?.adminBroadcast) {
-      return interaction.reply({
+      return interaction.editReply({
         content: '⚠️ Admin broadcast commands are currently disabled.',
-        ephemeral: true,
       });
     }
 
@@ -42,18 +44,16 @@ module.exports = {
     try {
       targetMessage = await interaction.channel.messages.fetch(messageId);
     } catch (err) {
-      return interaction.reply({
+      return interaction.editReply({
         content: `⚠️ Could not find a message with ID \`${messageId}\` in this channel.`,
-        ephemeral: true,
       });
     }
 
     try {
       await targetMessage.reply(replyText);
 
-      await interaction.reply({
+      await interaction.editReply({
         content: `✅ Successfully replied as bot to message \`${messageId}\`.`,
-        ephemeral: true,
       });
 
       const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
@@ -64,9 +64,8 @@ module.exports = {
       }, 'channel_role_changes').catch(() => {});
     } catch (err) {
       console.error('[reply-as-bot] Error replying to message:', err);
-      await interaction.reply({
+      await interaction.editReply({
         content: `Failed to reply to message: ${err.message}`,
-        ephemeral: true,
       });
     }
   },

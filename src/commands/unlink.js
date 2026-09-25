@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { SlashCommandBuilder, PermissionFlagsBits, MessageFlags } = require('discord.js');
 const config = require('../config');
 const api = require('../lib/api');
 const { checkCommandPermission } = require('../lib/permissions');
@@ -11,9 +11,9 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   async execute(interaction) {
-    if (!(await checkCommandPermission(interaction, 'unlink'))) return;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    await interaction.deferReply({ ephemeral: true });
+    if (!(await checkCommandPermission(interaction, 'unlink'))) return;
 
     const target = interaction.options.getMember('member');
     if (!target) {

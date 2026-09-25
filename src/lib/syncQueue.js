@@ -20,19 +20,38 @@ class SyncQueue {
    * @param {string} id - Identifier (e.g. discordUserId, osUserId, clusterId)
    * @param {Function} taskFn - Async function to execute
    * @param {number} [attempt=1]
+   * @param {Function} [resolve=null]
+   * @param {Function} [reject=null]
    */
-  enqueue(type, id, taskFn, attempt = 1) {
+  enqueue(type, id, taskFn, attempt = 1, resolve = null, reject = null) {
     const key = `${type}:${id}`;
     if (this.pendingSet.has(key)) {
+      if (resolve) resolve(null);
       return; // Already pending in queue to execute next
     }
 
     this.pendingSet.add(key);
-    this.queue.push({ type, id, key, taskFn, attempt });
+    this.queue.push({ type, id, key, taskFn, attempt, resolve, reject });
 
     if (!this.processing) {
       this.processQueue();
     }
+  }
+
+  /**
+   * Enqueues an async task and returns a Promise that resolves when the task completes.
+   * Employs the queue's rate limit handling, backoff, and retry mechanisms.
+   *
+   * @param {string} type
+   * @param {string} id
+   * @param {Function} taskFn
+   * @returns {Promise<any>}
+   */
+  enqueueAsync(type, id, taskFn) {
+    return new Promise((resolve, reject) => {
+      const opKey = `${id}:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
+      this.enqueue(type, opKey, taskFn, 1, resolve, reject);
+    });
   }
 
   /**
@@ -55,7 +74,8 @@ class SyncQueue {
       this.inFlightSet.add(item.key);
 
       try {
-        await item.taskFn();
+        const result = await item.taskFn();
+        if (item.resolve) item.resolve(result);
       } catch (err) {
         const isRateLimit =
           err.status === 429 ||
@@ -81,10 +101,11 @@ class SyncQueue {
             const backoffMs = Math.pow(2, item.attempt) * 500;
             console.log(`[SyncQueue] Scheduling retry ${item.attempt + 1}/${this.maxRetries} for ${item.key} after ${backoffMs}ms`);
             setTimeout(() => {
-              this.enqueue(item.type, item.id, item.taskFn, item.attempt + 1);
+              this.enqueue(item.type, item.id, item.taskFn, item.attempt + 1, item.resolve, item.reject);
             }, backoffMs);
           } else {
             console.error(`[SyncQueue] Job ${item.key} exceeded max retries (${this.maxRetries}). Dropping.`);
+            if (item.reject) item.reject(err);
           }
         }
       } finally {

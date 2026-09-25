@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { SlashCommandBuilder, PermissionFlagsBits, MessageFlags } = require('discord.js');
 const api = require('../lib/api');
 const { checkCommandPermission } = require('../lib/permissions');
 
@@ -14,9 +14,9 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
 
   async execute(interaction) {
-    if (!(await checkCommandPermission(interaction, 'ban'))) return;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    await interaction.deferReply({ ephemeral: true });
+    if (!(await checkCommandPermission(interaction, 'ban'))) return;
 
     const target = interaction.options.getUser('member');
     const reason = interaction.options.getString('reason') || 'No reason given';
@@ -30,7 +30,7 @@ module.exports = {
     }
 
     try {
-      const member = await interaction.guild.members.fetch(target.id).catch(() => null);
+      const member = interaction.guild.members.cache.get(target.id) || (await interaction.guild.members.fetch(target.id).catch(() => null));
       if (member) {
         if (!member.bannable) {
           await interaction.editReply({
@@ -57,6 +57,7 @@ module.exports = {
       targetTag: target.tag,
       reason,
       by: interaction.user.tag,
+      by_id: interaction.user.id,
     }, 'moderation').catch(() => {});
   },
 };

@@ -1,14 +1,27 @@
-const { Events, EmbedBuilder } = require('discord.js');
+const { Events } = require('discord.js');
 const config = require('../config');
 const api = require('../lib/api');
+const ticketSystem = require('../lib/ticketSystem');
+const { handleLinkServerMessage } = require('../lib/codeVerification');
 
 // In-memory rate-limit map for unverified member nudges (userId -> timestamp)
 const unverifiedNudgeMap = new Map();
 const NUDGE_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
 
+// Periodic cleanup of stale nudge timestamps to prevent memory growth (Section 5.8)
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, timestamp] of unverifiedNudgeMap.entries()) {
+    if (now - timestamp > NUDGE_COOLDOWN_MS) {
+      unverifiedNudgeMap.delete(userId);
+    }
+  }
+}, 10 * 60 * 1000).unref();
+
 /**
  * MessageCreate event handler.
- * - Feature 2: DM-to-staff forwarding for general user inquiries
+ * - Feature 1: Code-paste account linking (#link-server channel)
+ * - Feature 2: Lane-based ticketing system (users <-> staff forum threads)
  * - Feature 3: Friendly nudge for unverified members posting in chapter guilds
  */
 module.exports = {
@@ -16,72 +29,29 @@ module.exports = {
   async execute(message) {
     if (message.author.bot) return;
 
-    // FEATURE 2: DM-to-staff forwarding (no DMs are used for verification anymore)
+    // FEATURE 1: Code-paste account verification in #link-server
+    if (message.guild && message.channel.name?.toLowerCase().trim() === 'link-server') {
+      const handled = await handleLinkServerMessage(message);
+      if (handled) return;
+    }
+
+    // FEATURE 2A: Incoming user DMs -> Ticket system entry point
     if (!message.guild) {
-      if (!config.features?.dmForwarding) return;
-
-      try {
-        // Inform the user their message has been forwarded
-        await message.reply(
-          "I can't chat here directly, but I've forwarded your message to the Elevates team — they'll get back to you soon!"
-        ).catch(() => {});
-
-        // Build staff support embed
-        const dmEmbed = new EmbedBuilder()
-          .setColor(0xFF6B00)
-          .setAuthor({
-            name: `${message.author.tag || message.author.username} (${message.author.id})`,
-            iconURL: message.author.displayAvatarURL(),
-          })
-          .setTitle('📩 New Direct Message from Member')
-          .setDescription(message.content || '*(No text content / attachment only)*')
-          .setFooter({ text: `User ID: ${message.author.id} • Elevates Staff Forwarding` })
-          .setTimestamp(message.createdAt);
-
-        if (message.attachments.size > 0) {
-          const fileLinks = message.attachments.map((a) => `[${a.name}](${a.url})`).join('\n');
-          dmEmbed.addFields({ name: 'Attachments', value: fileLinks });
-        }
-
-        // Locate designated staff channel in MAIN server
-        let targetChannel = null;
-        const targetChannelName = config.staffDmForwardChannel || 'bot-commands';
-
-        const mainConfig = await api.getMainGuildConfig().catch(() => null);
-        let mainGuild = null;
-
-        if (mainConfig?.guildId) {
-          mainGuild = message.client.guilds.cache.get(mainConfig.guildId) ||
-            (await message.client.guilds.fetch(mainConfig.guildId).catch(() => null));
-        }
-
-        if (!mainGuild) {
-          mainGuild = message.client.guilds.cache.first();
-        }
-
-        if (mainGuild) {
-          targetChannel = mainGuild.channels.cache.find(
-            (c) =>
-              c.isTextBased &&
-              c.isTextBased() &&
-              c.name === targetChannelName &&
-              c.permissionsFor(mainGuild.members.me)?.has('SendMessages')
-          );
-        }
-
-        if (targetChannel) {
-          await targetChannel.send({ embeds: [dmEmbed] });
-        } else {
-          console.warn(`[dmForwarding] Could not find channel #${targetChannelName} to forward DM.`);
-        }
-      } catch (err) {
-        console.error('[dmForwarding] Error forwarding DM to staff:', err);
-      }
+      console.log(`[DM] Received DM from ${message.author.tag} (${message.author.id}), routing to ticket system: "${message.content}"`);
+      await ticketSystem.handleIncomingDm(message);
       return;
     }
 
+    // FEATURE 2B: Staff replies inside ticket forum threads -> User DM
+    if (message.guild && message.channel.isThread()) {
+      const handled = await ticketSystem.handleStaffReply(message);
+      if (handled) return;
+    }
+
     // FEATURE 3: Nudge unverified members who post in public channels
+    // Section 1.4: Old unverified-member-nudge MUST NOT fire inside #link-server itself
     if (message.guild) {
+      if (message.channel.name?.toLowerCase().trim() === 'link-server') return;
       if (!config.features?.unverifiedNudge) return;
 
       try {

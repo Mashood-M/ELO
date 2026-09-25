@@ -1,4 +1,4 @@
-const { EmbedBuilder } = require('discord.js');
+const { EmbedBuilder, MessageFlags } = require('discord.js');
 const accountLinking = require('./accountLinking');
 const api = require('./api');
 
@@ -13,7 +13,7 @@ async function handleButton(interaction) {
   }
 
   if (interaction.customId === 'check_os_verification') {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const identity = await api.getIdentityByDiscordId(interaction.user.id);
     if (identity && identity.profile) {
@@ -55,7 +55,7 @@ async function handleButton(interaction) {
   if (interaction.customId === 'os_link_no') {
     return interaction.reply({
       content: 'If you ever wish to connect your ElevatesOS account in the future, head over to `#link-server` anytime!',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 }

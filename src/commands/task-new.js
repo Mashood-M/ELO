@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, ChannelType } = require('discord.js');
+const { SlashCommandBuilder, ChannelType, PermissionFlagsBits, MessageFlags } = require('discord.js');
 const supabase = require('../lib/supabase');
 const api = require('../lib/api');
 const config = require('../config');
@@ -24,10 +24,11 @@ module.exports = {
         .setName('due_date')
         .setDescription('Optional deadline (e.g. 2026-09-25 or Friday 5pm)')
         .setRequired(false)
-    ),
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 
   async execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const title = interaction.options.getString('title').trim();
     const description = interaction.options.getString('description').trim();
@@ -99,6 +100,7 @@ module.exports = {
     // If still not identified (e.g. run in general chat), check if user hosts a cluster
     const callerIdentity = await api.getIdentityByDiscordId(interaction.user.id);
     const callerProfile = callerIdentity?.profile;
+    const callerUserRoles = callerIdentity?.userRoles || callerIdentity?.user_roles || [];
 
     if (!cluster) {
       // Find clusters where this user is the leader
@@ -117,11 +119,23 @@ module.exports = {
       }
     }
 
-    // 3. Permission check: Restricted to that cluster's Host role or the chapter's Campus Lead
-    const campusLeadRoleName = config.roles.campusLead || 'Campus Lead';
-    const isCampusLeadRole = interaction.member.roles.cache.some(
-      (r) => r.name.toLowerCase().trim() === campusLeadRoleName.toLowerCase().trim()
-    );
+    // 3. Permission check: Restricted to that cluster's Host role, the chapter's Campus Lead, or Executive Member
+    const campusLeadRoleName = (config.roles.campusLead || 'Campus Lead').toLowerCase().trim();
+    const execMemberRoleName = (config.roles.executiveMember || 'Executive Member').toLowerCase().trim();
+
+    const isCampusLeadOrExecRole = interaction.member.roles.cache.some((r) => {
+      const n = r.name.toLowerCase().trim();
+      return (
+        n === campusLeadRoleName ||
+        n === execMemberRoleName ||
+        ['executive member', 'executive team', 'executive'].includes(n)
+      );
+    });
+
+    const isCampusLeadOrExecOs = callerUserRoles?.some((r) => {
+      const k = (r.role_key || r.role || r.roles?.key || r.roles?.name || '').toLowerCase().trim();
+      return ['campus_lead', 'executive_member', 'exec_member', 'executive'].includes(k);
+    });
 
     const clusterHostRoleName = `${cluster.name} Host`.toLowerCase().trim();
     const isClusterHostRole = interaction.member.roles.cache.some(
@@ -130,9 +144,9 @@ module.exports = {
 
     const isClusterLeader = callerProfile && cluster.leader_id === callerProfile.id;
 
-    if (!isCampusLeadRole && !isClusterHostRole && !isClusterLeader) {
+    if (!isCampusLeadOrExecRole && !isCampusLeadOrExecOs && !isClusterHostRole && !isClusterLeader) {
       return interaction.editReply({
-        content: `⚠️ You must be the Host of **${cluster.name}** or the chapter's Campus Lead to create weekly tasks for this cluster.`,
+        content: `⚠️ You must be the Host of **${cluster.name}**, the chapter's Campus Lead, or an Executive Member to create weekly tasks for this cluster.`,
       });
     }
 

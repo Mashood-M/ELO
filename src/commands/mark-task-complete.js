@@ -1,4 +1,4 @@
-const { ContextMenuCommandBuilder, ApplicationCommandType } = require('discord.js');
+const { ContextMenuCommandBuilder, ApplicationCommandType, PermissionFlagsBits, MessageFlags } = require('discord.js');
 const supabase = require('../lib/supabase');
 const api = require('../lib/api');
 const config = require('../config');
@@ -6,10 +6,11 @@ const config = require('../config');
 module.exports = {
   data: new ContextMenuCommandBuilder()
     .setName('Mark Task Complete')
-    .setType(ApplicationCommandType.Message),
+    .setType(ApplicationCommandType.Message)
+    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
   async execute(interaction) {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const message = interaction.targetMessage;
     const channel = interaction.channel;
@@ -53,14 +54,27 @@ module.exports = {
       });
     }
 
-    // Check caller permissions: restricted to Host/Campus Lead of that cluster
+    // Check caller permissions: restricted to Host/Campus Lead/Executive Member of that cluster
     const callerIdentity = await api.getIdentityByDiscordId(interaction.user.id);
     const callerProfile = callerIdentity?.profile;
+    const callerUserRoles = callerIdentity?.userRoles || callerIdentity?.user_roles || [];
 
-    const campusLeadRoleName = config.roles.campusLead || 'Campus Lead';
-    const isCampusLeadRole = interaction.member.roles.cache.some(
-      (r) => r.name.toLowerCase().trim() === campusLeadRoleName.toLowerCase().trim()
-    );
+    const campusLeadRoleName = (config.roles.campusLead || 'Campus Lead').toLowerCase().trim();
+    const execMemberRoleName = (config.roles.executiveMember || 'Executive Member').toLowerCase().trim();
+
+    const isCampusLeadOrExecRole = interaction.member.roles.cache.some((r) => {
+      const n = r.name.toLowerCase().trim();
+      return (
+        n === campusLeadRoleName ||
+        n === execMemberRoleName ||
+        ['executive member', 'executive team', 'executive'].includes(n)
+      );
+    });
+
+    const isCampusLeadOrExecOs = callerUserRoles.some((r) => {
+      const k = (r.role_key || r.role || r.roles?.key || r.roles?.name || '').toLowerCase().trim();
+      return ['campus_lead', 'executive_member', 'exec_member', 'executive'].includes(k);
+    });
 
     const clusterHostRoleName = `${cluster.name} Host`.toLowerCase().trim();
     const isClusterHostRole = interaction.member.roles.cache.some(
@@ -69,9 +83,9 @@ module.exports = {
 
     const isClusterLeader = callerProfile && cluster.leader_id === callerProfile.id;
 
-    if (!isCampusLeadRole && !isClusterHostRole && !isClusterLeader) {
+    if (!isCampusLeadOrExecRole && !isCampusLeadOrExecOs && !isClusterHostRole && !isClusterLeader) {
       return interaction.editReply({
-        content: `⚠️ You must be the Host of **${cluster.name}** or the Campus Lead to mark tasks complete in this cluster.`,
+        content: `⚠️ You must be the Host of **${cluster.name}**, the Campus Lead, or an Executive Member to mark tasks complete in this cluster.`,
       });
     }
 

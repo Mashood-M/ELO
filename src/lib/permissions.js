@@ -1,4 +1,4 @@
-const { PermissionFlagsBits } = require('discord.js');
+const { PermissionFlagsBits, MessageFlags } = require('discord.js');
 const api = require('./api');
 const config = require('../config');
 
@@ -20,25 +20,43 @@ const COMMAND_PERMISSIONS = {
     founder: ['*'],
     hq_admin: ['*'],
     // Campus Lead has full access in their OWN chapter server
+    // Tier A: /ban, /unban, /unlink -> Campus Lead only
+    // Tier B: /kick, /mute, /warn, /warnings -> Campus Lead + configurable Tier B roles
     campus_lead: [
-      'kick',
       'ban',
       'unban',
+      'unlink',
+      'kick',
       'mute',
       'warn',
       'warnings',
-      'unlink',
       'announce',
       'reply-as-bot',
       'cluster',
     ],
-    // Class Representative has kick/mute/warn/warnings in their OWN chapter server only (NOT ban, unban, unlink)
-    class_representative: ['kick', 'mute', 'warn', 'warnings', 'cluster'],
-    class_rep: ['kick', 'mute', 'warn', 'warnings', 'cluster'],
     // Regular students can run informational commands like /cluster
     student: ['cluster'],
   },
 };
+
+// TODO: Once the formal Executive Team OS role exists and is stabilized,
+// Tier A commands (/ban, /unban, /unlink) can be evaluated to move to Tier B / executive roles.
+// For now, Tier A is strictly reserved for Campus Lead only.
+
+// Configurable Tier B roles in chapter servers (Campus Lead + Tier B roles)
+const tierBCommands = ['kick', 'mute', 'warn', 'warnings', 'announce', 'reply-as-bot', 'cluster'];
+const configuredTierBRoles = config.roles?.tierBRoles || [
+  'executive_member',
+  'exec_member',
+  'executive',
+  'class_representative',
+  'class_rep',
+  'moderator',
+];
+
+for (const roleKey of configuredTierBRoles) {
+  COMMAND_PERMISSIONS.chapter[roleKey] = [...tierBCommands];
+}
 
 /**
  * Evaluates whether a Discord user is authorized to execute a command in a guild
@@ -249,7 +267,7 @@ async function checkCommandPermission(interaction, commandName) {
     if (interaction.deferred) {
       await interaction.editReply({ content: `⚠️ ${errorMsg}` }).catch(() => {});
     } else {
-      await interaction.reply({ content: `⚠️ ${errorMsg}`, ephemeral: true }).catch(() => {});
+      await interaction.reply({ content: `⚠️ ${errorMsg}`, flags: MessageFlags.Ephemeral }).catch(() => {});
     }
 
     try {

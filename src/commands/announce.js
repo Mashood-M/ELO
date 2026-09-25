@@ -2,6 +2,7 @@ const {
   SlashCommandBuilder,
   ChannelType,
   PermissionFlagsBits,
+  MessageFlags,
 } = require('discord.js');
 const config = require('../config');
 const api = require('../lib/api');
@@ -27,10 +28,11 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 
   async execute(interaction) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
     if (!config.features?.adminBroadcast) {
-      return interaction.reply({
+      return interaction.editReply({
         content: '⚠️ Admin broadcast commands are currently disabled.',
-        ephemeral: true,
       });
     }
 
@@ -41,18 +43,16 @@ module.exports = {
     const messageContent = interaction.options.getString('message');
 
     if (!targetChannel.permissionsFor(interaction.guild.members.me)?.has('SendMessages')) {
-      return interaction.reply({
+      return interaction.editReply({
         content: `⚠️ I do not have permission to send messages in ${targetChannel}.`,
-        ephemeral: true,
       });
     }
 
     try {
       await targetChannel.send(messageContent);
 
-      await interaction.reply({
+      await interaction.editReply({
         content: `✅ Announcement posted successfully to ${targetChannel}.`,
-        ephemeral: true,
       });
 
       const guildConfig = await api.getGuildConfig(interaction.guild.id).catch(() => null);
@@ -63,9 +63,8 @@ module.exports = {
       }, 'channel_role_changes').catch(() => {});
     } catch (err) {
       console.error('[announce] Error broadcasting message:', err);
-      await interaction.reply({
+      await interaction.editReply({
         content: `Failed to send announcement: ${err.message}`,
-        ephemeral: true,
       });
     }
   },

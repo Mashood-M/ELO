@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { SlashCommandBuilder, PermissionFlagsBits, MessageFlags } = require('discord.js');
 const api = require('../lib/api');
 const { checkCommandPermission } = require('../lib/permissions');
 
@@ -10,9 +10,9 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers),
 
   async execute(interaction) {
-    if (!(await checkCommandPermission(interaction, 'unban'))) return;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    await interaction.deferReply({ ephemeral: true });
+    if (!(await checkCommandPermission(interaction, 'unban'))) return;
 
     const userId = interaction.options.getString('user_id');
 
@@ -39,6 +39,7 @@ module.exports = {
     api.logChapterEvent(interaction.client, guildConfig?.chapterId, interaction.guild.id, 'unban', {
       userId,
       by: interaction.user.tag,
+      by_id: interaction.user.id,
     }, 'moderation').catch(() => {});
   },
 };

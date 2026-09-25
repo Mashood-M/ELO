@@ -25,6 +25,7 @@ module.exports = {
     founder: process.env.ROLE_FOUNDER || 'ELEVATES • Founder',
     admin: process.env.ROLE_ADMIN || 'ELEVATES • Admin',
     campusLead: process.env.ROLE_CAMPUS_LEAD || 'Campus Lead',
+    executiveMember: process.env.ROLE_EXECUTIVE_MEMBER || 'Executive Member',
     classRep: process.env.ROLE_CLASS_REP || 'Class Rep',
     verified: process.env.ROLE_VERIFIED || 'ELEVATES • Member',
     unverified: process.env.ROLE_UNVERIFIED || 'elevates',
@@ -33,13 +34,19 @@ module.exports = {
       process.env.ROLE_ADMIN || 'ELEVATES • Admin',
       process.env.ROLE_FOUNDER || 'ELEVATES • Founder',
     ],
+    // Tier B moderation roles in chapter servers (Campus Lead + Tier B)
+    tierBRoles: [
+      'executive_member',
+      'exec_member',
+      'executive',
+      'class_representative',
+      'class_rep',
+      'moderator',
+    ],
   },
-
-  staffDmForwardChannel: process.env.STAFF_DM_FORWARD_CHANNEL || 'bot-commands',
 
   features: {
     welcomeCard: process.env.FEATURE_WELCOME_CARD !== 'false',
-    dmForwarding: process.env.FEATURE_DM_FORWARDING !== 'false',
     unverifiedNudge: process.env.FEATURE_UNVERIFIED_NUDGE !== 'false',
     adminBroadcast: process.env.FEATURE_ADMIN_BROADCAST !== 'false',
   },
@@ -70,6 +77,9 @@ module.exports = {
       admin: 'HQ Admin',
       community_manager: 'Community Manager',
       campus_lead: 'Campus Lead',
+      executive_member: 'Verified Member',
+      exec_member: 'Verified Member',
+      executive: 'Verified Member',
       class_representative: 'Class Rep',
       class_rep: 'Class Rep',
       guest: 'Guest',

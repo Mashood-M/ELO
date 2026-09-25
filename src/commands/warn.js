@@ -1,4 +1,4 @@
-const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { SlashCommandBuilder, PermissionFlagsBits, MessageFlags } = require('discord.js');
 const api = require('../lib/api');
 const { checkCommandPermission } = require('../lib/permissions');
 
@@ -11,9 +11,9 @@ module.exports = {
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
   async execute(interaction) {
-    if (!(await checkCommandPermission(interaction, 'warn'))) return;
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    await interaction.deferReply({ ephemeral: true });
+    if (!(await checkCommandPermission(interaction, 'warn'))) return;
 
     const target = interaction.options.getUser('member');
     const reason = interaction.options.getString('reason');
@@ -37,6 +37,7 @@ module.exports = {
       targetTag: target.tag,
       reason,
       by: interaction.user.tag,
+      by_id: interaction.user.id,
     }, 'moderation').catch(() => {});
   },
 };

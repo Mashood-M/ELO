@@ -6,6 +6,85 @@ const config = require('../config');
 
 // In-memory fallback token store if DB table chapter_setup_tokens is not yet migrated
 const inMemorySetupTokens = new Map();
+// In-memory cache for resolved chapter forum channels and thread maps
+const chapterForumCache = new Map();
+
+// In-memory cache for guild_config with TTL to reduce DB lookups (Section 5.2)
+const guildConfigCache = new Map(); // guildId -> { data, cachedAt }
+const GUILD_CONFIG_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Periodic cleanup of stale inMemorySetupTokens and guildConfigCache (Section 5.6)
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, data] of inMemorySetupTokens.entries()) {
+    if (data.expires_at && new Date(data.expires_at).getTime() < now) {
+      inMemorySetupTokens.delete(token);
+    }
+  }
+  for (const [guildId, entry] of guildConfigCache.entries()) {
+    if (now - entry.cachedAt > GUILD_CONFIG_TTL_MS) {
+      guildConfigCache.delete(guildId);
+    }
+  }
+}, 10 * 60 * 1000).unref();
+
+// Canonical topic specifications for chapter audit forums
+const STARTER_THREADS = [
+  {
+    key: 'role_changes',
+    name: '🎭 Role Changes',
+    description: 'ElevatesOS role assignments, promotions, demotions, and permission updates',
+    matchTerms: ['role changes', 'roles changes', 'role_changes'],
+  },
+  {
+    key: 'current_roles',
+    name: '👥 Current Roles',
+    description: 'live synchronized roster of all current chapter leads, core team, and role holders',
+    matchTerms: ['current roles', 'current_roles', 'roster'],
+  },
+  {
+    key: 'term_handover',
+    name: '🔄 Term Handover',
+    description: 'chapter term handovers, old CL/executive team demoted, new CL/executive team assigned',
+    matchTerms: ['term handover', 'term handovers', 'term_handover', 'term_handovers', 'handover', 'term transition'],
+  },
+  {
+    key: 'events',
+    name: '📅 Events & Meetups',
+    description: 'event creation, schedule updates, attendance check-ins, and form releases',
+    matchTerms: ['events', 'meetups', 'event creation'],
+  },
+  {
+    key: 'cluster_activity',
+    name: '🧠 Cluster Activity',
+    description: 'cluster created, member added/removed, host assigned/removed, tasks',
+    matchTerms: ['cluster'],
+  },
+  {
+    key: 'moderation',
+    name: '🛡️ Moderation',
+    description: 'kicks, bans, mutes, warns, and unlinks',
+    matchTerms: ['moderation'],
+  },
+  {
+    key: 'membership',
+    name: '👤 Membership',
+    description: 'member joined/left the chapter server, account linked/unlinked',
+    matchTerms: ['membership'],
+  },
+  {
+    key: 'channel_role_changes',
+    name: '⚙️ Channel & Role Changes',
+    description: 'server configuration, discord channels, and discord server role changes',
+    matchTerms: ['channel & role', 'server & channel', 'channel_role_changes', 'server logs', 'channel'],
+  },
+  {
+    key: 'discord_activity',
+    name: '💬 Discord Activity',
+    description: 'deleted messages, message edits, voice activity, invites, and discord server events',
+    matchTerms: ['discord activity', 'discord logs', 'chat', 'voice logs', 'discord messages'],
+  },
+];
 
 /**
  * Safely format an error into a standard Error object without exposing
@@ -24,6 +103,7 @@ function formatError(error, defaultMessage = 'Database operation failed') {
 }
 
 module.exports = {
+  STARTER_THREADS,
   /**
    * Generates a secure 6-digit OTP code (valid for 4 hours) for account linking.
    * Looks up user in profiles (by elevates_id, raw digits, UUID, or email).
@@ -358,6 +438,14 @@ module.exports = {
    * Looks up which chapter a guild is mapped to.
    */
   async getGuildConfig(guildId) {
+    if (!guildId) return null;
+
+    // Check in-memory cache first (Section 5.2)
+    const cached = guildConfigCache.get(guildId);
+    if (cached && Date.now() - cached.cachedAt < GUILD_CONFIG_TTL_MS) {
+      return cached.data;
+    }
+
     try {
       const { data, error } = await supabase
         .from('guild_config')
@@ -374,7 +462,7 @@ module.exports = {
 
         if (simpleErr || !simpleData) {
           if (guildId === config.mainGuildId) {
-            return {
+            const mainResult = {
               guildId,
               guild_id: guildId,
               guildType: 'main',
@@ -386,6 +474,8 @@ module.exports = {
               chapterElevatesId: null,
               elevates_id: null,
             };
+            guildConfigCache.set(guildId, { data: mainResult, cachedAt: Date.now() });
+            return mainResult;
           }
           return null;
         }
@@ -400,7 +490,7 @@ module.exports = {
           }
         }
 
-        return {
+        const simpleResult = {
           guildId: simpleData.guild_id,
           guild_id: simpleData.guild_id,
           guildType: simpleData.guild_type,
@@ -417,13 +507,15 @@ module.exports = {
           campus_lead_discord_id: simpleData.campus_lead_discord_id || null,
           createdAt: simpleData.created_at,
         };
+        guildConfigCache.set(guildId, { data: simpleResult, cachedAt: Date.now() });
+        return simpleResult;
       }
 
       const chapterObj = Array.isArray(data.chapters) ? data.chapters[0] : data.chapters;
       const chapterName = chapterObj?.name || null;
       const chapterElevatesId = chapterObj?.elevates_id || null;
 
-      return {
+      const result = {
         guildId: data.guild_id,
         guild_id: data.guild_id,
         guildType: data.guild_type,
@@ -440,9 +532,11 @@ module.exports = {
         campus_lead_discord_id: data.campus_lead_discord_id || null,
         createdAt: data.created_at,
       };
+      guildConfigCache.set(guildId, { data: result, cachedAt: Date.now() });
+      return result;
     } catch (err) {
       if (guildId === config.mainGuildId) {
-        return {
+        const fallbackMain = {
           guildId,
           guild_id: guildId,
           guildType: 'main',
@@ -454,6 +548,8 @@ module.exports = {
           chapterElevatesId: null,
           elevates_id: null,
         };
+        guildConfigCache.set(guildId, { data: fallbackMain, cachedAt: Date.now() });
+        return fallbackMain;
       }
       return null;
     }
@@ -488,6 +584,8 @@ module.exports = {
         .single();
 
       if (error) throw formatError(error, 'Failed to set guild configuration');
+
+      guildConfigCache.delete(guildId);
 
       let chapterName = chapterObj?.name || null;
       let chapterElevatesId = chapterObj?.elevates_id || null;
@@ -937,6 +1035,19 @@ module.exports = {
       });
     }
 
+    // Ensure Executive Member role exists
+    const execMemberRoleName = config.roles.executiveMember || 'Executive Member';
+    let execMemberRole = guild.roles.cache.find(
+      (r) => !r.managed && [execMemberRoleName.toLowerCase(), 'executive team', 'executive'].includes(r.name.toLowerCase().trim())
+    );
+    if (!execMemberRole) {
+      execMemberRole = await guild.roles.create({
+        name: execMemberRoleName,
+        color: 0x3B82F6,
+        reason: 'ElevatesOS Executive Member Role Setup',
+      });
+    }
+
     // Requirement: Give Campus Lead's Discord role Administrator permission WITHIN THIS chapter server only
     try {
       if (!campusLeadRole.permissions.has(PermissionFlagsBits.Administrator)) {
@@ -1007,6 +1118,14 @@ module.exports = {
       console.warn('[provisionChapterGuild] ensureLinkChannel error:', err.message)
     );
 
+    // 6. Ensure private leadership/insider section with Executive Member tier under Campus Lead tier
+    let leadershipSection = null;
+    try {
+      leadershipSection = await this.ensureChapterLeadershipSection(guild, chapterId);
+    } catch (leadErr) {
+      console.warn('[provisionChapterGuild] ensureChapterLeadershipSection error:', leadErr.message);
+    }
+
     return {
       chapterName,
       chapterSlug,
@@ -1014,6 +1133,8 @@ module.exports = {
       elevatesId: chapterElevatesId,
       guildId: guild.id,
       campusLeadRole,
+      execMemberRole,
+      leadershipSection,
       logChannel: chapterManagementLogChannel,
     };
   },
@@ -1035,9 +1156,95 @@ module.exports = {
       const chapter = await this.getChapterByIdentifier(chapterId);
       if (!chapter) return null;
 
+      const resolvedChapterId = chapter.id;
       const chapterName = chapter.name || 'Chapter';
       const chapterSlug = (chapter.slug || chapterName).toLowerCase().replace(/[^a-z0-9]+/g, '-');
       const channelName = `chp-${chapterSlug}`.slice(0, 100);
+
+      // 0. Fast Path: Check in-memory cache
+      const cached = chapterForumCache.get(resolvedChapterId);
+      if (cached && (Date.now() - cached.timestamp < 15 * 60 * 1000)) {
+        const forumChannel = client.channels.cache.get(cached.forumChannelId) ||
+          await client.channels.fetch(cached.forumChannelId).catch(() => null);
+        if (forumChannel) {
+          const threadMap = {};
+          let allFound = true;
+          for (const [key, thId] of Object.entries(cached.threadIds)) {
+            if (!thId) { allFound = false; continue; }
+            const th = client.channels.cache.get(thId) || await client.channels.fetch(thId).catch(() => null);
+            if (th) threadMap[key] = th;
+            else allFound = false;
+          }
+          if (allFound && Object.keys(threadMap).length >= STARTER_THREADS.length) {
+            return { forumChannel, threadMap, chapterName };
+          }
+        }
+      }
+
+      // 0.1 Fast Path: Check chapter_log_channels database record & resolve threads directly from forum
+      try {
+        const { data: dbLogRecord } = await supabase
+          .from('chapter_log_channels')
+          .select('channel_id')
+          .eq('chapter_id', resolvedChapterId)
+          .maybeSingle();
+
+        if (dbLogRecord?.channel_id) {
+          const forumChannel = client.channels.cache.get(dbLogRecord.channel_id) ||
+            await client.channels.fetch(dbLogRecord.channel_id).catch(() => null);
+          if (forumChannel && forumChannel.type === ChannelType.GuildForum) {
+            const fetchedActive = await forumChannel.threads.fetchActive().catch(() => ({ threads: new Map() }));
+            const fetchedArchived = await forumChannel.threads.fetchArchived().catch(() => ({ threads: new Map() }));
+            const allThreads = new Map([...(fetchedActive.threads || new Map()), ...(fetchedArchived.threads || new Map())]);
+
+            const threadMap = {};
+            for (const tSpec of STARTER_THREADS) {
+              const thread = Array.from(allThreads.values()).find((th) => {
+                const norm = th.name.toLowerCase().trim();
+                const raw = norm.replace(/[^a-z0-9]/g, '');
+                const specNorm = tSpec.name.toLowerCase().trim();
+                const specRaw = specNorm.replace(/[^a-z0-9]/g, '');
+                if (norm === specNorm || raw === specRaw) return true;
+
+                if (tSpec.key === 'role_changes') {
+                  return (norm.includes('role changes') || norm.includes('roles changes')) && !norm.includes('channel');
+                }
+                if (tSpec.key === 'channel_role_changes') {
+                  return norm.includes('channel & role') || norm.includes('server & channel') || (norm.includes('channel') && norm.includes('role'));
+                }
+                if (tSpec.key === 'discord_activity') {
+                  return (norm.includes('discord') || norm.includes('chat') || norm.includes('messages')) && !norm.includes('cluster');
+                }
+                if (tSpec.key === 'current_roles') {
+                  return norm.includes('current roles') || norm.includes('roster');
+                }
+                if (tSpec.key === 'events') {
+                  return norm.includes('events') || norm.includes('meetups');
+                }
+                if (tSpec.key === 'term_handover') {
+                  return norm.includes('term handover') || norm.includes('handover') || norm.includes('term_handover');
+                }
+                return tSpec.matchTerms.some((term) => norm.includes(term));
+              });
+
+              if (thread) {
+                if (thread.archived) await thread.setArchived(false).catch(() => {});
+                if (thread.joinable) await thread.join().catch(() => {});
+                threadMap[tSpec.key] = thread;
+              }
+            }
+
+            if (Object.keys(threadMap).length >= STARTER_THREADS.length) {
+              chapterForumCache.set(resolvedChapterId, {
+                forumChannelId: forumChannel.id,
+                threadIds: Object.fromEntries(Object.entries(threadMap).map(([k, t]) => [k, t.id])),
+                timestamp: Date.now(),
+              });
+              return { forumChannel, threadMap, chapterName };
+            }
+          }
+        }
+      } catch (_) {}
 
       // 1. Locate Main Server
       let mainGuild = null;
@@ -1046,28 +1253,40 @@ module.exports = {
         mainGuild = client.guilds.cache.get(mainConfig.guildId) ||
           (await client.guilds.fetch(mainConfig.guildId).catch(() => null));
       }
+      if (!mainGuild && config.mainGuildId) {
+        mainGuild = client.guilds.cache.get(config.mainGuildId) ||
+          (await client.guilds.fetch(config.mainGuildId).catch(() => null));
+      }
       if (!mainGuild) {
         mainGuild = client.guilds.cache.find((g) => g.id !== mainConfig?.guildId) || client.guilds.cache.first();
       }
       if (!mainGuild) return null;
 
-      // 2. Find or create "Chapter Management" category
-      let category = mainGuild.channels.cache.find(
-        (c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase().includes('chapter management')
-      );
-      if (!category) {
-        category = await mainGuild.channels.create({
-          name: 'Chapter Management',
-          type: ChannelType.GuildCategory,
-          reason: 'ElevatesOS Chapter Oversight',
-        });
-      }
+      // Ensure channel and role caches are fresh in Main Server
+      await mainGuild.channels.fetch().catch(() => {});
+      await mainGuild.roles.fetch().catch(() => {});
 
-      // 3. Setup Founders-only permissions
+      // 2. Find or create private "CHAPTER LOGS 🔒" category
+      let category = mainGuild.channels.cache.find(
+        (c) =>
+          c.type === ChannelType.GuildCategory &&
+          (c.name.toLowerCase().includes('chapter log') ||
+            c.name.toLowerCase().includes('chapter-log') ||
+            c.name.toLowerCase() === 'chapter logs')
+      );
+
+      // Setup Founders & HQ Admin private permissions
       const founderRole = mainGuild.roles.cache.find(
         (r) =>
           r.name.toLowerCase().includes('founder') ||
           r.name.toLowerCase() === (config.roles.founder || '').toLowerCase()
+      );
+
+      const adminRole = mainGuild.roles.cache.find(
+        (r) =>
+          r.name === 'HQ Admin' ||
+          r.name.toLowerCase().includes('admin') ||
+          r.name.toLowerCase() === (config.roles.admin || '').toLowerCase()
       );
 
       const permissionOverwrites = [
@@ -1086,6 +1305,7 @@ module.exports = {
             PermissionFlagsBits.CreatePrivateThreads,
             PermissionFlagsBits.SendMessagesInThreads,
             PermissionFlagsBits.EmbedLinks,
+            PermissionFlagsBits.ReadMessageHistory,
           ],
         },
       ];
@@ -1101,16 +1321,32 @@ module.exports = {
         });
       }
 
-      // 4. Find or create Forum channel
-      let forumChannel = mainGuild.channels.cache.find(
-        (c) => c.name === channelName && c.parentId === category.id
-      );
-
-      // If existing channel is flat text, delete it to replace with Forum
-      if (forumChannel && forumChannel.type !== ChannelType.GuildForum) {
-        await forumChannel.delete('Replacing flat text log channel with Forum channel').catch(() => {});
-        forumChannel = null;
+      if (adminRole && adminRole.id !== founderRole?.id) {
+        permissionOverwrites.push({
+          id: adminRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.SendMessagesInThreads,
+          ],
+        });
       }
+
+      if (!category) {
+        category = await mainGuild.channels.create({
+          name: 'CHAPTER LOGS 🔒',
+          type: ChannelType.GuildCategory,
+          permissionOverwrites,
+          reason: 'Dedicated private category for all chapter log forums',
+        });
+      } else {
+        await category.permissionOverwrites.set(permissionOverwrites).catch(() => {});
+      }
+
+      // 3. Find or create Forum channel (NEVER delete an existing text channel!)
+      let forumChannel = mainGuild.channels.cache.find(
+        (c) => c.name === channelName && (c.parentId === category.id || !c.parentId)
+      ) || mainGuild.channels.cache.find((c) => c.name === channelName);
 
       if (!forumChannel) {
         try {
@@ -1118,72 +1354,83 @@ module.exports = {
             name: channelName,
             type: ChannelType.GuildForum,
             parent: category.id,
-            topic: `ElevatesOS Official Audit Log for ${chapterName} Chapter (${chapterId})`,
+            topic: `ElevatesOS Official Audit Log for ${chapterName} Chapter (${resolvedChapterId})`,
             permissionOverwrites,
             reason: `Forum audit log channel for ${chapterName} Chapter`,
           });
         } catch (forumErr) {
-          // Fallback to GuildText if guild lacks COMMUNITY feature
           console.warn(`[ensureChapterLogForum] GuildForum creation failed, falling back to GuildText:`, forumErr.message);
           forumChannel = await mainGuild.channels.create({
             name: channelName,
             type: ChannelType.GuildText,
             parent: category.id,
-            topic: `ElevatesOS Official Audit Log for ${chapterName} Chapter (${chapterId})`,
+            topic: `ElevatesOS Official Audit Log for ${chapterName} Chapter (${resolvedChapterId})`,
             permissionOverwrites,
             reason: `Fallback audit log channel for ${chapterName} Chapter`,
           }).catch(() => null);
         }
+      } else if (forumChannel.parentId !== category.id) {
+        await forumChannel.setParent(category.id, { lockPermissions: false }).catch(() => {});
       }
 
       if (!forumChannel) return null;
 
-      // 5. Ensure the 4 starter threads exist
-      const STARTER_THREADS = [
-        {
-          key: 'moderation',
-          name: '🛡️ Moderation',
-          description: 'kicks, bans, mutes, warns, and unlinks',
-        },
-        {
-          key: 'cluster_activity',
-          name: '🧠 Cluster Activity',
-          description: 'cluster created, member added/removed, host assigned/removed',
-        },
-        {
-          key: 'channel_role_changes',
-          name: '⚙️ Channel & Role Changes',
-          description: 'any role or channel created or modified for this chapter',
-        },
-        {
-          key: 'membership',
-          name: '👤 Membership',
-          description: 'member joined/left the chapter server, account linked/unlinked',
-        },
-      ];
-
+      // 4. Ensure the 7 function topics/threads exist
       const threadMap = {};
 
       if (forumChannel.type === ChannelType.GuildForum) {
         const fetchedActive = await forumChannel.threads.fetchActive().catch(() => ({ threads: new Map() }));
-        const activeThreads = fetchedActive.threads || new Map();
+        const fetchedArchived = await forumChannel.threads.fetchArchived().catch(() => ({ threads: new Map() }));
+        const allThreads = new Map([...(fetchedActive.threads || new Map()), ...(fetchedArchived.threads || new Map())]);
 
         for (const tSpec of STARTER_THREADS) {
-          let thread = Array.from(activeThreads.values()).find(
-            (th) =>
-              th.name.toLowerCase().trim() === tSpec.name.toLowerCase().trim() ||
-              th.name.toLowerCase().replace(/[^a-z0-9]/g, '') === tSpec.name.toLowerCase().replace(/[^a-z0-9]/g, '')
-          );
+          let thread = Array.from(allThreads.values()).find((th) => {
+            const norm = th.name.toLowerCase().trim();
+            const raw = norm.replace(/[^a-z0-9]/g, '');
+            const specNorm = tSpec.name.toLowerCase().trim();
+            const specRaw = specNorm.replace(/[^a-z0-9]/g, '');
+            if (norm === specNorm || raw === specRaw) return true;
+
+            if (tSpec.key === 'role_changes') {
+              return (norm.includes('role changes') || norm.includes('roles changes')) && !norm.includes('channel');
+            }
+            if (tSpec.key === 'channel_role_changes') {
+              return norm.includes('channel & role') || norm.includes('server & channel') || (norm.includes('channel') && norm.includes('role'));
+            }
+            if (tSpec.key === 'discord_activity') {
+              return (norm.includes('discord') || norm.includes('chat') || norm.includes('messages')) && !norm.includes('cluster');
+            }
+            if (tSpec.key === 'current_roles') {
+              return norm.includes('current roles') || norm.includes('roster');
+            }
+            if (tSpec.key === 'events') {
+              return norm.includes('events') || norm.includes('meetups');
+            }
+            if (tSpec.key === 'term_handover') {
+              return norm.includes('term handover') || norm.includes('handover') || norm.includes('term_handover');
+            }
+            return tSpec.matchTerms.some((term) => norm.includes(term));
+          });
+
+          if (thread && thread.archived) {
+            await thread.setArchived(false).catch(() => {});
+          }
+          if (thread && thread.joinable) {
+            await thread.join().catch(() => {});
+          }
 
           if (!thread) {
             try {
               thread = await forumChannel.threads.create({
                 name: tSpec.name,
                 message: {
-                  content: `**${tSpec.name} Audit Log Thread**\nOfficial log of all ${tSpec.description} for **${chapterName}**.\n\n_Auto-managed by ElevatesOS._`,
+                  content: `**${tSpec.name} Topic**\nOfficial log of all ${tSpec.description} for **${chapterName}**.\n\n_Auto-managed by ElevatesOS._`,
                 },
                 reason: `Starter audit thread for ${chapterName}`,
               });
+              if (thread && thread.joinable) {
+                await thread.join().catch(() => {});
+              }
             } catch (thErr) {
               console.error(`[ensureChapterLogForum] Could not create thread ${tSpec.name}:`, thErr.message);
             }
@@ -1193,24 +1440,96 @@ module.exports = {
             threadMap[tSpec.key] = thread;
           }
         }
+      } else if (forumChannel.type === ChannelType.GuildText) {
+        const fetchedActive = await forumChannel.threads.fetchActive().catch(() => ({ threads: new Map() }));
+        const activeThreads = fetchedActive.threads || new Map();
+
+        for (const tSpec of STARTER_THREADS) {
+          let thread = Array.from(activeThreads.values()).find((th) => {
+            const norm = th.name.toLowerCase().trim();
+            const raw = norm.replace(/[^a-z0-9]/g, '');
+            const specNorm = tSpec.name.toLowerCase().trim();
+            const specRaw = specNorm.replace(/[^a-z0-9]/g, '');
+            if (norm === specNorm || raw === specRaw) return true;
+
+            if (tSpec.key === 'role_changes') {
+              return (norm.includes('role changes') || norm.includes('roles changes')) && !norm.includes('channel');
+            }
+            if (tSpec.key === 'channel_role_changes') {
+              return norm.includes('channel & role') || norm.includes('server & channel') || (norm.includes('channel') && norm.includes('role'));
+            }
+            if (tSpec.key === 'discord_activity') {
+              return (norm.includes('discord') || norm.includes('chat') || norm.includes('messages')) && !norm.includes('cluster');
+            }
+            if (tSpec.key === 'current_roles') {
+              return norm.includes('current roles') || norm.includes('roster');
+            }
+            if (tSpec.key === 'events') {
+              return norm.includes('events') || norm.includes('meetups');
+            }
+            if (tSpec.key === 'term_handover') {
+              return norm.includes('term handover') || norm.includes('handover') || norm.includes('term_handover');
+            }
+            return tSpec.matchTerms.some((term) => norm.includes(term));
+          });
+
+          if (thread && thread.joinable) {
+            await thread.join().catch(() => {});
+          }
+
+          if (!thread) {
+            try {
+              thread = await forumChannel.threads.create({
+                name: tSpec.name,
+                autoArchiveDuration: 10080,
+                reason: `Starter audit thread for ${chapterName}`,
+              });
+              if (thread && thread.joinable) {
+                await thread.join().catch(() => {});
+              }
+              await thread.send(`**${tSpec.name} Topic**\nOfficial log of all ${tSpec.description} for **${chapterName}**.\n\n_Auto-managed by ElevatesOS._`).catch(() => {});
+            } catch (thErr) {
+              console.error(`[ensureChapterLogForum] Could not create fallback thread ${tSpec.name}:`, thErr.message);
+            }
+          }
+
+          if (thread) {
+            threadMap[tSpec.key] = thread;
+          }
+        }
       }
 
-      // 6. Update references in chapter_log_channels table
+      // Cache resolved forum channel & thread IDs in memory
+      chapterForumCache.set(resolvedChapterId, {
+        forumChannelId: forumChannel.id,
+        threadIds: Object.fromEntries(Object.entries(threadMap).map(([k, t]) => [k, t.id])),
+        timestamp: Date.now(),
+      });
+
+      // Initialize or refresh live roster in 👥 Current Roles topic
+      if (threadMap['current_roles']) {
+        this.updateChapterCurrentRolesTopic(client, resolvedChapterId, threadMap['current_roles']).catch(() => {});
+      }
+
+      // 5. Update references in chapter_log_channels table
       try {
+        const payload = {
+          chapter_id: resolvedChapterId,
+          main_guild_id: mainGuild.id,
+          channel_id: forumChannel.id,
+          term_handover_thread_id: threadMap['term_handover']?.id || null,
+          role_changes_thread_id: threadMap['role_changes']?.id || null,
+          current_roles_thread_id: threadMap['current_roles']?.id || null,
+          events_thread_id: threadMap['events']?.id || null,
+          moderation_thread_id: threadMap['moderation']?.id || null,
+          cluster_activity_thread_id: threadMap['cluster_activity']?.id || null,
+          channel_role_changes_thread_id: threadMap['channel_role_changes']?.id || null,
+          membership_thread_id: threadMap['membership']?.id || null,
+        };
+
         await supabase
           .from('chapter_log_channels')
-          .upsert(
-            {
-              chapter_id: chapterId,
-              main_guild_id: mainGuild.id,
-              channel_id: forumChannel.id,
-              moderation_thread_id: threadMap['moderation']?.id || null,
-              cluster_activity_thread_id: threadMap['cluster_activity']?.id || null,
-              channel_role_changes_thread_id: threadMap['channel_role_changes']?.id || null,
-              membership_thread_id: threadMap['membership']?.id || null,
-            },
-            { onConflict: 'chapter_id' }
-          );
+          .upsert(payload, { onConflict: 'chapter_id' });
       } catch (err) {
         console.warn('[ensureChapterLogForum] Could not update chapter_log_channels:', err.message);
       }
@@ -1227,14 +1546,563 @@ module.exports = {
   },
 
   /**
+   * Ensures the private leadership/insider channel section exists in each chapter server.
+   * Under the existing Campus Lead tier, adds an "Executive Member" tier visible to
+   * campus_lead + executive_member roles for that chapter.
+   *
+   * @param {import('discord.js').Guild} guild
+   * @param {object|string} chapterIdOrIdentifier
+   */
+  async ensureChapterLeadershipSection(guild, chapterIdOrIdentifier) {
+    if (!guild) return null;
+    const currentConfig = await this.getGuildConfig(guild.id).catch(() => null);
+    if (currentConfig?.guildType === 'main' || guild.id === config.mainGuildId) return null;
+
+    try {
+      await guild.channels.fetch().catch(() => {});
+      await guild.roles.fetch().catch(() => {});
+
+      // 1. Resolve Campus Lead and Executive Member roles in this chapter server
+      const campusLeadRoleName = (config.roles?.campusLead || 'Campus Lead').toLowerCase().trim();
+      const execMemberRoleName = (config.roles?.executiveMember || 'Executive Member').toLowerCase().trim();
+
+      let campusLeadRole = guild.roles.cache.find(
+        (r) => !r.managed && r.name.toLowerCase().trim() === campusLeadRoleName
+      );
+      if (!campusLeadRole && guild.members.me?.permissions.has(PermissionFlagsBits.ManageRoles)) {
+        campusLeadRole = await guild.roles.create({
+          name: config.roles?.campusLead || 'Campus Lead',
+          color: 0xF59E0B,
+          reason: 'ElevatesOS Campus Lead Role Setup',
+        }).catch(() => null);
+      }
+
+      let execMemberRole = guild.roles.cache.find(
+        (r) => !r.managed && [execMemberRoleName, 'executive team', 'executive'].includes(r.name.toLowerCase().trim())
+      );
+      if (!execMemberRole && guild.members.me?.permissions.has(PermissionFlagsBits.ManageRoles)) {
+        execMemberRole = await guild.roles.create({
+          name: config.roles?.executiveMember || 'Executive Member',
+          color: 0x3B82F6,
+          reason: 'ElevatesOS Executive Member Role Setup',
+        }).catch(() => null);
+      }
+
+      // 2. Find or create private leadership category
+      let category = guild.channels.cache.find(
+        (c) =>
+          c.type === ChannelType.GuildCategory &&
+          (c.name.toLowerCase().includes('leadership') ||
+            c.name.toLowerCase().includes('insider') ||
+            c.name.toLowerCase() === 'leadership 🔒' ||
+            c.name.toLowerCase() === 'leadership')
+      );
+
+      const categoryOverwrites = [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel],
+        },
+        {
+          id: guild.client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ManageRoles,
+            PermissionFlagsBits.ReadMessageHistory,
+          ],
+        },
+      ];
+
+      if (campusLeadRole) {
+        categoryOverwrites.push({
+          id: campusLeadRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        });
+      }
+
+      if (execMemberRole) {
+        categoryOverwrites.push({
+          id: execMemberRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        });
+      }
+
+      if (!category && guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+        category = await guild.channels.create({
+          name: 'LEADERSHIP 🔒',
+          type: ChannelType.GuildCategory,
+          permissionOverwrites: categoryOverwrites,
+          reason: 'Private chapter leadership and insider section',
+        }).catch(() => null);
+      } else if (category && guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+        await category.permissionOverwrites.set(categoryOverwrites).catch(() => {});
+      }
+
+      const categoryId = category?.id;
+
+      // 3. Ensure Campus Lead Lounge (visible ONLY to Campus Lead + bot)
+      let campusLeadChannel = guild.channels.cache.find(
+        (c) =>
+          (c.name === 'campus-lead' || c.name === 'campus-lead-lounge') &&
+          (!categoryId || c.parentId === categoryId)
+      );
+
+      const clChannelOverwrites = [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel],
+        },
+        {
+          id: guild.client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ReadMessageHistory,
+          ],
+        },
+      ];
+
+      if (campusLeadRole) {
+        clChannelOverwrites.push({
+          id: campusLeadRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        });
+      }
+
+      if (execMemberRole) {
+        clChannelOverwrites.push({
+          id: execMemberRole.id,
+          deny: [PermissionFlagsBits.ViewChannel],
+        });
+      }
+
+      if (!campusLeadChannel && guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+        campusLeadChannel = await guild.channels.create({
+          name: 'campus-lead',
+          type: ChannelType.GuildText,
+          parent: categoryId,
+          topic: 'Private leadership channel for the Campus Lead',
+          permissionOverwrites: clChannelOverwrites,
+          reason: 'Chapter Campus Lead private tier',
+        }).catch(() => null);
+      } else if (campusLeadChannel && guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+        await campusLeadChannel.permissionOverwrites.set(clChannelOverwrites).catch(() => {});
+      }
+
+      // 4. Ensure Executive Member Tier (under Campus Lead, visible to campus_lead + executive_member)
+      let execMemberChannel = guild.channels.cache.find(
+        (c) =>
+          (c.name === 'executive-members' || c.name === 'executive-lounge') &&
+          (!categoryId || c.parentId === categoryId)
+      );
+
+      const execChannelOverwrites = [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel],
+        },
+        {
+          id: guild.client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ManageChannels,
+            PermissionFlagsBits.ReadMessageHistory,
+          ],
+        },
+      ];
+
+      if (campusLeadRole) {
+        execChannelOverwrites.push({
+          id: campusLeadRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        });
+      }
+
+      if (execMemberRole) {
+        execChannelOverwrites.push({
+          id: execMemberRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.EmbedLinks,
+          ],
+        });
+      }
+
+      if (!execMemberChannel && guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+        execMemberChannel = await guild.channels.create({
+          name: 'executive-members',
+          type: ChannelType.GuildText,
+          parent: categoryId,
+          topic: 'Private chapter leadership channel for Campus Lead and Executive Members',
+          permissionOverwrites: execChannelOverwrites,
+          reason: 'Chapter Executive Member tier under Campus Lead',
+        }).catch(() => null);
+      } else if (execMemberChannel && guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) {
+        await execMemberChannel.permissionOverwrites.set(execChannelOverwrites).catch(() => {});
+      }
+
+      return {
+        category,
+        campusLeadChannel,
+        execMemberChannel,
+        execChannel: execMemberChannel,
+      };
+    } catch (err) {
+      console.warn('[ensureChapterLeadershipSection] Warning:', err.message);
+      return null;
+    }
+  },
+
+  /**
+   * Logs a term-handover event for a chapter into the Main Server forum's "🔄 Term Handover" thread.
+   *
+   * @param {import('discord.js').Client} client
+   * @param {string} chapterId
+   * @param {string} [guildId=null]
+   * @param {object} [data={}]
+   */
+  async logTermHandoverEvent(client, chapterId, guildId = null, data = {}) {
+    const detail = {
+      term: data.term || data.term_name || data.termName || 'Chapter Term Transition',
+      old_campus_lead: data.old_campus_lead || data.oldCampusLead || null,
+      new_campus_lead: data.new_campus_lead || data.newCampusLead || null,
+      demoted_executives: data.demoted_executives || data.demotedExecutives || null,
+      assigned_executives: data.assigned_executives || data.assignedExecutives || null,
+      timestamp: `<t:${Math.floor(Date.now() / 1000)}:F>`,
+      ...data,
+    };
+    return this.logChapterEvent(client, chapterId, guildId, 'term_handover', detail, 'term_handover');
+  },
+
+  /**
+   * Updates the live roster in the 👥 Current Roles topic for a chapter.
+   * Keeps an official pinned embed updated with Campus Lead, Class Reps, Core Team, etc.
+   */
+  async updateChapterCurrentRolesTopic(client, chapterId, targetThread = null) {
+    try {
+      if (!client || !chapterId) return;
+
+      // 1. Fetch chapter details
+      const chapter = await this.getChapterByIdentifier(chapterId);
+      if (!chapter) return;
+      const resolvedChapterId = chapter.id;
+
+      // 2. Fetch Campus Lead if designated
+      let campusLeadProfile = null;
+      if (chapter.campus_lead_id) {
+        const { data: lead } = await supabase
+          .from('profiles')
+          .select('id, full_name, email, discord_user_id, discord_username, department, year, designation, role, elevates_id')
+          .eq('id', chapter.campus_lead_id)
+          .single();
+        campusLeadProfile = lead;
+      }
+
+      // 3. Fetch user_roles for this chapter
+      const { data: chapterRoles } = await supabase
+        .from('user_roles')
+        .select('id, user_id, role_key, role, valid_from, valid_to, created_at')
+        .eq('chapter_id', resolvedChapterId);
+
+      const roleUserIds = [...new Set((chapterRoles || []).map((r) => r.user_id).filter(Boolean))];
+
+      // 4. Fetch all profiles associated with chapter and chapterRoles
+      const profilesMap = new Map();
+      const { data: chapterProfiles } = await supabase
+        .from('profiles')
+        .select('id, full_name, email, discord_user_id, discord_username, department, year, designation, role, elevates_id')
+        .eq('chapter_id', resolvedChapterId);
+
+      if (chapterProfiles) {
+        for (const p of chapterProfiles) profilesMap.set(p.id, p);
+      }
+
+      const missingRoleUserIds = roleUserIds.filter((uid) => !profilesMap.has(uid));
+      if (missingRoleUserIds.length > 0) {
+        const { data: extraProfiles } = await supabase
+          .from('profiles')
+          .select('id, full_name, email, discord_user_id, discord_username, department, year, designation, role, elevates_id')
+          .in('id', missingRoleUserIds);
+        if (extraProfiles) {
+          for (const p of extraProfiles) profilesMap.set(p.id, p);
+        }
+      }
+      if (campusLeadProfile && !profilesMap.has(campusLeadProfile.id)) {
+        profilesMap.set(campusLeadProfile.id, campusLeadProfile);
+      }
+
+      // 5. Build Grouped Roles Roster
+      let leadDisplay = '*No Campus Lead currently assigned.*';
+      if (campusLeadProfile) {
+        const dId = campusLeadProfile.discord_user_id;
+        const mention = dId ? `<@${dId}>` : '*(No Discord linked)*';
+        const dept = campusLeadProfile.department ? ` • ${campusLeadProfile.department}` : '';
+        const yr = campusLeadProfile.year ? ` Yr ${campusLeadProfile.year}` : '';
+        const elId = campusLeadProfile.elevates_id ? ` • \`${campusLeadProfile.elevates_id}\`` : '';
+        leadDisplay = `👑 **${campusLeadProfile.full_name || 'Unknown'}** ${elId}\n  └ ${mention}${dept}${yr}`;
+      }
+
+      const executiveMembers = [];
+      const classReps = [];
+      const coreTeam = [];
+      const otherRoles = [];
+
+      const formatUser = (p, roleTitle = null) => {
+        const name = p?.full_name || 'Member';
+        const mention = p?.discord_user_id ? `<@${p.discord_user_id}>` : '*(No Discord)*';
+        const dept = p?.department ? ` • ${p.department}` : '';
+        const yr = p?.year ? ` • Yr ${p.year}` : '';
+        const elId = p?.elevates_id ? ` • \`${p.elevates_id}\`` : '';
+        if (roleTitle) {
+          return `• **${roleTitle}**: ${name} (${mention})${dept}${yr}`;
+        }
+        return `• **${name}** (${mention})${dept}${yr}${elId}`;
+      };
+
+      // 5a. Inspect profiles designation & role
+      for (const [, p] of profilesMap) {
+        const des = (p.designation || '').toLowerCase().trim();
+        const roleStr = (p.role || '').toLowerCase().trim();
+
+        const isExecMember =
+          des.includes('executive_member') ||
+          des.includes('exec_member') ||
+          des === 'executive' ||
+          roleStr.includes('executive_member') ||
+          roleStr.includes('exec_member') ||
+          roleStr === 'executive';
+
+        const isClassRep =
+          des.includes('class_rep') ||
+          des.includes('class representative') ||
+          des.includes('class rep') ||
+          roleStr.includes('class representative') ||
+          roleStr.includes('class rep');
+
+        const isCore =
+          des.includes('core') ||
+          des.includes('coordinator') ||
+          des.includes('head') ||
+          roleStr.includes('coordinator') ||
+          roleStr.includes('core');
+
+        if (isExecMember && p.id !== chapter.campus_lead_id) {
+          const line = formatUser(p, 'Executive Member');
+          if (!executiveMembers.some((em) => em.includes(p.full_name || p.id))) {
+            executiveMembers.push(line);
+          }
+        }
+
+        if (isClassRep) {
+          const line = formatUser(p);
+          if (!classReps.some((c) => c.includes(p.full_name || p.id))) {
+            classReps.push(line);
+          }
+        }
+
+        if (isCore && p.id !== chapter.campus_lead_id && !isExecMember) {
+          const title = (p.designation || p.role || 'Core Team')
+            .replace(/_/g, ' ')
+            .replace(/\b\w/g, (c) => c.toUpperCase());
+          const line = formatUser(p, title);
+          if (!coreTeam.some((c) => c.includes(p.full_name || p.id))) {
+            coreTeam.push(line);
+          }
+        }
+      }
+
+      // 5b. Inspect user_roles table records
+      if (chapterRoles && chapterRoles.length > 0) {
+        for (const r of chapterRoles) {
+          const p = profilesMap.get(r.user_id);
+          const name = p?.full_name || 'Unknown';
+          const rKey = (r.role_key || r.role || '').toLowerCase().trim();
+
+          if (rKey === 'student' || rKey === 'member') continue;
+          if (rKey.includes('lead') && r.user_id === chapter.campus_lead_id) continue;
+
+          const title = (r.role_key || r.role || 'Role')
+            .replace(/_/g, ' ')
+            .replace(/-/g, ' ')
+            .replace(/\b\w/g, (c) => c.toUpperCase());
+
+          if (rKey === 'executive_member' || rKey === 'exec_member' || rKey === 'executive') {
+            const line = formatUser(p, 'Executive Member');
+            if (!executiveMembers.some((em) => em.includes(name))) {
+              executiveMembers.push(line);
+            }
+          } else if (rKey.includes('rep')) {
+            if (!classReps.some((cr) => cr.includes(name))) {
+              classReps.push(formatUser(p));
+            }
+          } else if (
+            rKey.includes('lead') ||
+            rKey.includes('head') ||
+            rKey.includes('core') ||
+            rKey.includes('coordinator') ||
+            rKey.includes('manager')
+          ) {
+            const line = formatUser(p, title);
+            if (!coreTeam.some((ct) => ct.includes(name) && ct.includes(title))) {
+              coreTeam.push(line);
+            }
+          } else {
+            const line = formatUser(p, title);
+            if (!otherRoles.some((ot) => ot.includes(name) && ot.includes(title))) {
+              otherRoles.push(line);
+            }
+          }
+        }
+      }
+
+      const nowUnix = Math.floor(Date.now() / 1000);
+      const embed = new EmbedBuilder()
+        .setColor(0x3B82F6)
+        .setTitle(`👥 Current Leadership & Roles Roster — ${chapter.name}`)
+        .setDescription(
+          `Official synchronized leadership structure and active roles for **${chapter.name}**.\n` +
+          `• **Last Synchronized:** <t:${nowUnix}:R> (<t:${nowUnix}:T>)\n` +
+          `*This roster automatically updates in real time with ElevatesOS.*`
+        )
+        .addFields(
+          {
+            name: '👑 Campus Lead',
+            value: leadDisplay,
+            inline: false,
+          },
+          {
+            name: `⚡ Executive Members (${executiveMembers.length})`,
+            value: executiveMembers.length > 0 ? executiveMembers.join('\n') : '*None assigned*',
+            inline: false,
+          },
+          {
+            name: `🎓 Class Representatives (${classReps.length})`,
+            value: classReps.length > 0 ? classReps.join('\n') : '*None assigned*',
+            inline: false,
+          },
+          {
+            name: `🛠️ Core Team & Coordinators (${coreTeam.length})`,
+            value: coreTeam.length > 0 ? coreTeam.join('\n') : '*None assigned*',
+            inline: false,
+          }
+        );
+
+      if (otherRoles.length > 0) {
+        embed.addFields({
+          name: `🎖️ Additional Roles (${otherRoles.length})`,
+          value: otherRoles.slice(0, 15).join('\n'),
+          inline: false,
+        });
+      }
+
+      embed.addFields({
+        name: '📊 Chapter Overview',
+        value: `• **Chapter ID:** \`${chapter.id}\`\n• **Elevates ID:** \`${chapter.elevates_id || 'N/A'}\`\n• **College:** ${chapter.college || 'N/A'}\n• **Status:** \`${chapter.status || 'active'}\``,
+        inline: false,
+      });
+
+      embed.setFooter({
+        text: 'ElevatesOS Live Chapter Roster • Auto-updating',
+      });
+      embed.setTimestamp();
+
+      // 6. Find target thread if not passed
+      let thread = targetThread;
+      if (!thread) {
+        const forumData = await this.ensureChapterLogForum(client, resolvedChapterId);
+        thread = forumData?.threadMap?.['current_roles'];
+      }
+
+      if (!thread) return;
+
+      if (thread.joinable) {
+        await thread.join().catch(() => {});
+      }
+      if (thread.archived) {
+        await thread.setArchived(false).catch(() => {});
+      }
+
+      // 7. Find existing pinned roster message or bot message to edit
+      const messages = await thread.messages.fetch({ limit: 25 }).catch(() => null);
+      const rosterMsgs = messages
+        ? Array.from(messages.values()).filter(
+            (m) =>
+              m.author.id === client.user.id &&
+              m.embeds.length > 0 &&
+              (m.embeds[0].footer?.text?.includes('ElevatesOS Live Chapter Roster') ||
+                m.embeds[0].title?.includes('Current Leadership & Roles Roster'))
+          )
+        : [];
+
+      if (rosterMsgs.length > 0) {
+        await rosterMsgs[0].edit({ embeds: [embed] }).catch((err) => {
+          console.error('[updateChapterCurrentRolesTopic] Edit error:', err.message);
+        });
+        if (!rosterMsgs[0].pinned) {
+          await rosterMsgs[0].pin().catch(() => {});
+        }
+        // Clean up duplicate roster messages if any
+        for (const dup of rosterMsgs.slice(1)) {
+          await dup.delete().catch(() => {});
+        }
+      } else {
+        const newMsg = await thread.send({ embeds: [embed] }).catch((err) => {
+          console.error('[updateChapterCurrentRolesTopic] Send error:', err.message);
+          return null;
+        });
+        if (newMsg) {
+          await newMsg.pin().catch(() => {});
+        }
+      }
+    } catch (err) {
+      console.error('[updateChapterCurrentRolesTopic] Error:', err);
+    }
+  },
+
+  /**
    * Centralized event logger that logs to discord_events_log
    * AND routes chapter-specific events to the appropriate starter thread in the chapter's log forum.
    *
    * Categories:
+   * - "term_handover": term handover events, old CL/executive team demoted, new CL/executive team assigned
+   * - "role_changes": ElevatesOS role assignments, promotions, demotions, permission updates
+   * - "current_roles": live synchronized roster of chapter leadership
+   * - "events": event creation, schedule updates, attendance, forms
+   * - "cluster_activity": cluster created, member added/removed, host assigned/removed, tasks
    * - "moderation": kicks, bans, mutes, warns, unlinks
-   * - "cluster_activity": cluster created, member added/removed, host assigned/removed
-   * - "channel_role_changes": any role or channel created/modified for this chapter
-   * - "membership": member joined/left the chapter server, account linked/unlinked
+   * - "membership": member joined/left chapter server, account linked/unlinked, OTP
+   * - "channel_role_changes": server configuration, discord channels, and guild roles
    */
   async logChapterEvent(client, chapterId, guildId, eventType, detail = {}, category = null) {
     try {
@@ -1242,34 +2110,121 @@ module.exports = {
       try {
         await supabase.from('discord_events_log').insert({
           guild_id: guildId || 'global',
-          discord_user_id: detail.discord_user_id || detail.userId || detail.targetId || null,
+          discord_user_id: detail.discord_user_id || detail.userId || detail.targetId || detail.target_id || null,
           event_type: eventType,
           detail,
         });
       } catch (_) {}
 
-      // 2. Resolve chapterId if not provided
-      if (!chapterId && guildId) {
-        const guildConfig = await this.getGuildConfig(guildId);
-        chapterId = guildConfig?.chapterId;
-      }
+      if (!client) return;
 
-      if (!chapterId || !client) return;
+      // 2. Comprehensive chapter resolution
+      if (!chapterId) {
+        if (detail.chapter_id || detail.chapterId) {
+          chapterId = detail.chapter_id || detail.chapterId;
+        } else if (guildId && guildId !== config.mainGuildId) {
+          const guildConfig = await this.getGuildConfig(guildId).catch(() => null);
+          chapterId = guildConfig?.chapterId;
+        }
+
+        // Check target user's identity in ElevatesOS
+        const targetUserId = detail.discord_user_id || detail.targetId || detail.userId || detail.target_id;
+        if (!chapterId && targetUserId) {
+          try {
+            const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(targetUserId);
+            const identity = isUuid
+              ? await this.getIdentityByOsUserId(targetUserId)
+              : await this.getIdentityByDiscordId(targetUserId);
+            if (identity?.profile?.chapter_id || identity?.chapterId) {
+              chapterId = identity.profile?.chapter_id || identity.chapterId;
+            }
+          } catch (_) {}
+        }
+
+        // Check executor / author's identity in ElevatesOS
+        const executorUserId = detail.by_id || detail.executor_id || detail.caller_id || detail.moderator_id || detail.author_id || detail.userId;
+        if (!chapterId && executorUserId) {
+          try {
+            const identity = await this.getIdentityByDiscordId(executorUserId);
+            if (identity?.profile?.chapter_id) {
+              chapterId = identity.profile.chapter_id;
+            }
+          } catch (_) {}
+        }
+
+        if (!chapterId && detail.by && typeof detail.by === 'string' && client) {
+          const userObj = client.users.cache.find((u) => u.tag === detail.by || u.username === detail.by);
+          if (userObj) {
+            try {
+              const identity = await this.getIdentityByDiscordId(userObj.id);
+              if (identity?.profile?.chapter_id) {
+                chapterId = identity.profile.chapter_id;
+              }
+            } catch (_) {}
+          }
+        }
+      }
 
       // 3. Determine log category
       let targetCategory = category;
       if (!targetCategory) {
         const t = (eventType || '').toLowerCase();
         if (
+          t.includes('term_handover') ||
+          t.includes('handover') ||
+          t.includes('term_transition') ||
+          t.includes('term_demote') ||
+          t.includes('term_promote') ||
+          t.includes('term_end') ||
+          t.includes('term_start') ||
+          t === 'term_handover' ||
+          t === 'term_handovers'
+        ) {
+          targetCategory = 'term_handover';
+        } else if (
           t.includes('kick') ||
           t.includes('ban') ||
           t.includes('mute') ||
+          t.includes('timeout') ||
           t.includes('warn') ||
           t.includes('unlink') ||
+          t.includes('clear') ||
           t === 'moderation'
         ) {
           targetCategory = 'moderation';
-        } else if (t.includes('cluster') || t.includes('host')) {
+        } else if (
+          t.includes('message_delete') ||
+          t.includes('message_edit') ||
+          t.includes('message_bulk_delete') ||
+          t.includes('voice') ||
+          t.includes('invite') ||
+          t.includes('thread') ||
+          t === 'discord_activity'
+        ) {
+          targetCategory = 'discord_activity';
+        } else if (
+          t.includes('event') ||
+          t.includes('attendance') ||
+          t.includes('form') ||
+          t.includes('meetup') ||
+          t === 'events'
+        ) {
+          targetCategory = 'events';
+        } else if (
+          t.includes('role_assign') ||
+          t.includes('role_revoke') ||
+          t.includes('role_remove') ||
+          t.includes('role_change') ||
+          t.includes('role_insert') ||
+          t.includes('role_update') ||
+          t.includes('role_delete') ||
+          t.includes('designation') ||
+          t.includes('campus_lead') ||
+          t.includes('os_role') ||
+          t === 'role_changes'
+        ) {
+          targetCategory = 'role_changes';
+        } else if (t.includes('cluster') || t.includes('host') || t.includes('task')) {
           targetCategory = 'cluster_activity';
         } else if (
           t.includes('join') ||
@@ -1277,6 +2232,8 @@ module.exports = {
           t.includes('link') ||
           t.includes('member_join') ||
           t.includes('member_leave') ||
+          t.includes('otp') ||
+          t.includes('nickname') ||
           t === 'membership'
         ) {
           targetCategory = 'membership';
@@ -1285,40 +2242,158 @@ module.exports = {
         }
       }
 
-      // 4. Ensure Forum channel and starter threads exist in Main Guild
-      const forumData = await this.ensureChapterLogForum(client, chapterId);
-      if (!forumData) return;
+      // 4. If chapterId was resolved, post in the chapter's dedicated forum in CHAPTER LOGS category
+      if (chapterId) {
+        const forumData = await this.ensureChapterLogForum(client, chapterId);
+        if (forumData) {
+          const { forumChannel, threadMap, chapterName } = forumData;
+          let targetDestination = threadMap[targetCategory];
 
-      const { forumChannel, threadMap, chapterName } = forumData;
-      const targetDestination = threadMap[targetCategory] || forumChannel;
+          // Ensure targetDestination is ALWAYS a valid ThreadChannel if in a Forum
+          if (!targetDestination || (forumChannel.type === ChannelType.GuildForum && !targetDestination.isThread())) {
+            if (forumChannel.type === ChannelType.GuildForum) {
+              const fetchedActive = await forumChannel.threads.fetchActive().catch(() => ({ threads: new Map() }));
+              const fetchedArchived = await forumChannel.threads.fetchArchived().catch(() => ({ threads: new Map() }));
+              const allThreads = Array.from(new Map([...(fetchedActive.threads || new Map()), ...(fetchedArchived.threads || new Map())]).values());
 
-      // 5. Post embed into the target thread
-      const embed = new EmbedBuilder()
-        .setColor(
-          eventType.includes('ban') || eventType.includes('kick') || eventType.includes('unlink')
-            ? 0xEF4444
-            : eventType.includes('warn')
-            ? 0xF59E0B
-            : eventType.includes('cluster')
-            ? 0x8B5CF6
-            : eventType.includes('join') || eventType.includes('activate')
-            ? 0x22C55E
-            : 0x3B82F6
-        )
-        .setTitle(`📌 Event: ${eventType.toUpperCase().replace(/_/g, ' ')}`)
-        .setDescription(
-          Object.entries(detail)
-            .map(([k, v]) => `• **${k}:** ${typeof v === 'object' ? JSON.stringify(v) : v}`)
-            .join('\n') || 'No additional details.'
-        )
-        .setFooter({ text: `${chapterName} Audit Log • ${targetCategory}` })
-        .setTimestamp();
+              targetDestination = allThreads.find((th) => {
+                const norm = th.name.toLowerCase().trim();
+                if (targetCategory === 'term_handover') {
+                  return norm.includes('term handover') || norm.includes('handover') || norm.includes('term');
+                }
+                if (targetCategory === 'role_changes') {
+                  return (norm.includes('role changes') || norm.includes('roles changes')) && !norm.includes('channel');
+                }
+                if (targetCategory === 'current_roles') {
+                  return norm.includes('current roles') || norm.includes('roster');
+                }
+                if (targetCategory === 'events') {
+                  return norm.includes('events') || norm.includes('meetups');
+                }
+                if (targetCategory === 'cluster_activity') {
+                  return norm.includes('cluster');
+                }
+                if (targetCategory === 'moderation') {
+                  return norm.includes('moderation');
+                }
+                if (targetCategory === 'membership') {
+                  return norm.includes('membership');
+                }
+                if (targetCategory === 'channel_role_changes') {
+                  return norm.includes('channel & role') || norm.includes('server & channel') || norm.includes('channel');
+                }
+                if (targetCategory === 'discord_activity') {
+                  return norm.includes('discord') || norm.includes('chat') || norm.includes('activity') || norm.includes('messages');
+                }
+                return norm.includes(targetCategory.replace(/_/g, ' '));
+              }) || allThreads[0];
 
-      if (targetDestination && typeof targetDestination.send === 'function') {
-        await targetDestination.send({ embeds: [embed] }).catch((err) => {
-          console.error(`[logChapterEvent] Could not send message to log thread:`, err.message);
-        });
+              if (!targetDestination) {
+                targetDestination = await forumChannel.threads.create({
+                  name: `📋 ${targetCategory.toUpperCase().replace(/_/g, ' ')}`,
+                  message: { content: `**Audit Log for ${chapterName}**\nAuto-created log thread.` },
+                  reason: `Starter audit thread for ${chapterName}`,
+                }).catch(() => null);
+              }
+            } else {
+              targetDestination = forumChannel;
+            }
+          }
+
+          if (targetDestination) {
+            // Unarchive thread if archived
+            if (targetDestination.archived) {
+              await targetDestination.setArchived(false).catch(() => {});
+            }
+            if (targetDestination.joinable) {
+              await targetDestination.join().catch(() => {});
+            }
+
+            const embedColor =
+              eventType.includes('handover') || eventType.includes('term')
+                ? 0x6366F1
+                : eventType.includes('ban') || eventType.includes('kick') || eventType.includes('unlink') || eventType.includes('delete')
+                ? 0xEF4444
+                : eventType.includes('warn') || eventType.includes('timeout') || eventType.includes('mute')
+                ? 0xF59E0B
+                : eventType.includes('edit') || eventType.includes('update')
+                ? 0x3B82F6
+                : eventType.includes('voice')
+                ? 0x10B981
+                : eventType.includes('event') || eventType.includes('attendance') || eventType.includes('form')
+                ? 0x06B6D4
+                : eventType.includes('role') || eventType.includes('designation') || eventType.includes('lead')
+                ? 0xEC4899
+                : eventType.includes('cluster') || eventType.includes('task')
+                ? 0x8B5CF6
+                : eventType.includes('join') || eventType.includes('activate') || eventType.includes('link') || eventType.includes('verified')
+                ? 0x22C55E
+                : 0x3B82F6;
+
+            const emojiMap = {
+              term_handover: '🔄',
+              events: '📅',
+              role_changes: '🎭',
+              current_roles: '👥',
+              cluster_activity: '🧠',
+              moderation: '🛡️',
+              membership: '👤',
+              channel_role_changes: '⚙️',
+              discord_activity: '💬',
+            };
+            const catEmoji = emojiMap[targetCategory] || '📌';
+
+            const embed = new EmbedBuilder()
+              .setColor(embedColor)
+              .setTitle(`${catEmoji} Event: ${eventType.toUpperCase().replace(/_/g, ' ')}`)
+              .setDescription(
+                Object.entries(detail)
+                  .filter(([k]) => k !== 'discord_user_id')
+                  .map(([k, v]) => `• **${k.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase())}:** ${typeof v === 'object' ? JSON.stringify(v) : v}`)
+                  .join('\n') || 'No additional details.'
+              )
+              .setFooter({ text: `${chapterName} • ${targetCategory.replace(/_/g, ' ')}` })
+              .setTimestamp();
+
+            await targetDestination.send({ embeds: [embed] }).catch((err) => {
+              console.error(`[logChapterEvent] Could not send message to log thread:`, err.message);
+            });
+            return;
+          }
+        }
       }
+
+      // 5. Fallback: If not chapter-specific or chapter forum unavailable, log to Main Server general moderation channel
+      try {
+        const mainConfig = await this.getMainGuildConfig();
+        const mainGuildId = mainConfig?.guildId || config.mainGuildId;
+        const mainGuild = mainGuildId
+          ? (client.guilds.cache.get(mainGuildId) || await client.guilds.fetch(mainGuildId).catch(() => null))
+          : null;
+
+        if (mainGuild) {
+          const generalModLog = mainGuild.channels.cache.find(
+            (c) =>
+              c.type === ChannelType.GuildText &&
+              (c.name === 'moderation' || c.name === 'mod-log' || c.name === 'bot-log' || c.name.includes('moderation'))
+          );
+
+          if (generalModLog) {
+            const fallbackEmbed = new EmbedBuilder()
+              .setColor(0x3B82F6)
+              .setTitle(`📌 General Event: ${eventType.toUpperCase().replace(/_/g, ' ')}`)
+              .setDescription(
+                Object.entries(detail)
+                  .map(([k, v]) => `• **${k.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase())}:** ${typeof v === 'object' ? JSON.stringify(v) : v}`)
+                  .join('\n') || 'No additional details.'
+              )
+              .setFooter({ text: 'Elevates Main Server Log' })
+              .setTimestamp();
+
+            await generalModLog.send({ embeds: [fallbackEmbed] }).catch(() => {});
+          }
+        }
+      } catch (_) {}
     } catch (err) {
       console.error('[logChapterEvent] Error logging event:', err.message);
     }
@@ -1498,6 +2573,23 @@ module.exports = {
                 try {
                   await member.roles.add(discordRole);
                   console.log(`[syncUserAcrossGuilds] Added main role "${discordRole.name}" to ${member.user.tag}`);
+                  const targetChapter = userChapterId || profile?.chapter_id;
+                  if (targetChapter) {
+                    this.logChapterEvent(
+                      client,
+                      targetChapter,
+                      guild.id,
+                      'role_assigned',
+                      {
+                        user: `<@${member.id}> (${profile.full_name || member.user.username})`,
+                        role: discordRole.name,
+                        server: 'Main Server',
+                        discord_user_id: member.id,
+                      },
+                      'role_changes'
+                    ).catch(() => {});
+                    this.updateChapterCurrentRolesTopic(client, targetChapter).catch(() => {});
+                  }
                 } catch (err) {
                   console.warn(`[syncUserAcrossGuilds] Could not add main role "${discordRole.name}" to ${member.user.tag}:`, err.message);
                 }
@@ -1505,6 +2597,23 @@ module.exports = {
                 try {
                   await member.roles.remove(discordRole);
                   console.log(`[syncUserAcrossGuilds] Removed main role "${discordRole.name}" from ${member.user.tag}`);
+                  const targetChapter = userChapterId || profile?.chapter_id;
+                  if (targetChapter) {
+                    this.logChapterEvent(
+                      client,
+                      targetChapter,
+                      guild.id,
+                      'role_revoked',
+                      {
+                        user: `<@${member.id}> (${profile.full_name || member.user.username})`,
+                        role: discordRole.name,
+                        server: 'Main Server',
+                        discord_user_id: member.id,
+                      },
+                      'role_changes'
+                    ).catch(() => {});
+                    this.updateChapterCurrentRolesTopic(client, targetChapter).catch(() => {});
+                  }
                 } catch (err) {
                   console.warn(`[syncUserAcrossGuilds] Could not remove main role "${discordRole.name}" from ${member.user.tag}:`, err.message);
                 }
@@ -1557,6 +2666,11 @@ module.exports = {
             // 1. Ensure verified role and remove unverified/guest
             if (verifiedRole && !member.roles.cache.has(verifiedRole.id)) {
               await member.roles.add(verifiedRole).catch(() => {});
+              this.logChapterEvent(client, guildChapterId, guild.id, 'account_linked', {
+                member: member.user.tag,
+                fullName: profile.full_name || member.user.username,
+                elevatesId: profile.elevates_id || identity?.chapterId || 'Linked',
+              }, 'membership').catch(() => {});
             }
             if (unverifiedRole && member.roles.cache.has(unverifiedRole.id)) {
               await member.roles.remove(unverifiedRole).catch(() => {});
@@ -1602,7 +2716,8 @@ module.exports = {
               const gRole = guild.roles.cache.find(
                 (r) => !r.managed && (
                   r.name.toLowerCase().trim() === rName.toLowerCase().trim() ||
-                  (rDef.key === 'class_representative' && r.name.toLowerCase().trim() === 'class rep')
+                  (rDef.key === 'class_representative' && r.name.toLowerCase().trim() === 'class rep') ||
+                  (rDef.key === 'executive_member' && (r.name.toLowerCase().trim() === 'executive member' || r.name.toLowerCase().trim() === 'executive team' || r.name.toLowerCase().trim() === 'executive'))
                 )
               );
               if (!gRole) continue;
@@ -1610,14 +2725,43 @@ module.exports = {
               const shouldHave =
                 userChapterRoleKeys.has(rDef.key.toLowerCase()) ||
                 (rDef.key === 'campus_lead' && userChapterRoleKeys.has('campus_lead')) ||
-                (rDef.key === 'class_representative' && (userChapterRoleKeys.has('class_representative') || userChapterRoleKeys.has('class_rep')));
+                (rDef.key === 'class_representative' && (userChapterRoleKeys.has('class_representative') || userChapterRoleKeys.has('class_rep'))) ||
+                (rDef.key === 'executive_member' && (userChapterRoleKeys.has('executive_member') || userChapterRoleKeys.has('exec_member') || userChapterRoleKeys.has('executive')));
 
               if (shouldHave && !member.roles.cache.has(gRole.id)) {
                 await member.roles.add(gRole).catch(() => {});
                 console.log(`[syncUserAcrossGuilds] Added chapter role "${gRole.name}" to ${member.user.tag}`);
+                this.logChapterEvent(
+                  client,
+                  guildChapterId,
+                  guild.id,
+                  'role_assigned',
+                  {
+                    user: `<@${member.id}> (${profile.full_name || member.user.username})`,
+                    role: gRole.name,
+                    server: guild.name,
+                    discord_user_id: member.id,
+                  },
+                  'role_changes'
+                ).catch(() => {});
+                this.updateChapterCurrentRolesTopic(client, guildChapterId).catch(() => {});
               } else if (!shouldHave && member.roles.cache.has(gRole.id)) {
                 await member.roles.remove(gRole).catch(() => {});
                 console.log(`[syncUserAcrossGuilds] Removed chapter role "${gRole.name}" from ${member.user.tag}`);
+                this.logChapterEvent(
+                  client,
+                  guildChapterId,
+                  guild.id,
+                  'role_revoked',
+                  {
+                    user: `<@${member.id}> (${profile.full_name || member.user.username})`,
+                    role: gRole.name,
+                    server: guild.name,
+                    discord_user_id: member.id,
+                  },
+                  'role_changes'
+                ).catch(() => {});
+                this.updateChapterCurrentRolesTopic(client, guildChapterId).catch(() => {});
               }
             }
 

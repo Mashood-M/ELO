@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
-    "deploy-commands": "node src/deploy-commands.js"
+    "deploy-commands": "node src/deploy-commands.js",
+    "test": "node tests/ticketSystem.test.js && node tests/roleSyncAndInsiderMenu.test.js && node tests/clusterSync.test.js && node tests/consolidationPass.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.116.0",
