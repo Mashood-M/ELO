@@ -136,6 +136,45 @@ async function getChapterGuild(client, chapterId) {
 }
 
 /**
+ * Resolves the Discord Guild for a cluster based on its access_mode.
+ * - access_mode = 'open' -> MAIN server (via guild_config where guild_type = 'main', fallback config.mainGuildId).
+ * - access_mode = 'invite' (or any other/closed value) -> chapter server via guild_config (chapter_id).
+ *
+ * @param {import('discord.js').Client} client
+ * @param {object} cluster - Cluster record (must contain access_mode, and chapter_id if scoped to chapter)
+ * @returns {Promise<import('discord.js').Guild|null>}
+ */
+async function getClusterGuild(client, cluster) {
+  if (!client || !cluster) return null;
+
+  if (cluster.access_mode === 'open') {
+    try {
+      const { data: mainConfig, error } = await supabase
+        .from('guild_config')
+        .select('guild_id')
+        .eq('guild_type', 'main')
+        .maybeSingle();
+
+      const mainGuildId = (!error && mainConfig?.guild_id) ? mainConfig.guild_id : config.mainGuildId;
+      if (mainGuildId) {
+        return client.guilds.cache.get(mainGuildId) ||
+          (await client.guilds.fetch(mainGuildId).catch(() => null));
+      }
+    } catch (err) {
+      console.warn('[clusterSync] Error resolving main guild for open cluster:', err.message);
+      if (config.mainGuildId) {
+        return client.guilds.cache.get(config.mainGuildId) ||
+          (await client.guilds.fetch(config.mainGuildId).catch(() => null));
+      }
+    }
+    return null;
+  }
+
+  // Default (invite, closed, etc.): chapter server
+  return getChapterGuild(client, cluster.chapter_id);
+}
+
+/**
  * SECTION 3: CLUSTER CREATION (handleClusterCreated)
  *
  * Exact order:
@@ -161,7 +200,7 @@ async function handleClusterCreated(client, clusterData) {
   if (!client || !clusterData) return null;
 
   let cluster = clusterData;
-  if (!cluster.name || !cluster.chapter_id) {
+  if (!cluster.name || (!cluster.chapter_id && cluster.access_mode !== 'open')) {
     const { data: fetched, error } = await supabase
       .from('clusters')
       .select('*')
@@ -181,9 +220,10 @@ async function handleClusterCreated(client, clusterData) {
   }
 
   try {
-    const guild = await getChapterGuild(client, cluster.chapter_id);
+    const guild = await getClusterGuild(client, cluster);
     if (!guild) {
-      throw new Error(`No provisioned chapter guild found for chapter ${cluster.chapter_id}`);
+      const targetDesc = cluster.access_mode === 'open' ? 'main server' : `chapter ${cluster.chapter_id}`;
+      throw new Error(`No provisioned guild found for ${targetDesc}`);
     }
 
     const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
@@ -555,7 +595,7 @@ async function handleMemberAdded(client, memberRow) {
     }
 
     // 2. IF linked:
-    const guild = await getChapterGuild(client, cluster.chapter_id);
+    const guild = await getClusterGuild(client, cluster);
     if (!guild) {
       await supabase
         .from('pending_discord_roles')
@@ -576,7 +616,7 @@ async function handleMemberAdded(client, memberRow) {
         discordRoleId: cluster.discord_role_id || null,
         action: 'granted',
         success: true,
-        errorMessage: 'Chapter guild not reachable yet; queued in pending_discord_roles',
+        errorMessage: 'Target guild not reachable yet; queued in pending_discord_roles',
       });
       return;
     }
@@ -702,15 +742,17 @@ async function handleMemberRemoved(client, memberRow) {
 
     let roleRevoked = false;
 
-    if (discordUserId && cluster?.chapter_id) {
-      const guild = await getChapterGuild(client, cluster.chapter_id);
+    const roleInCluster = memberRow.role_in_cluster || 'member';
+
+    if (discordUserId && cluster) {
+      const guild = await getClusterGuild(client, cluster);
       if (guild) {
         const member = guild.members.cache.get(discordUserId) ||
           (await guild.members.fetch(discordUserId).catch(() => null));
 
         if (member) {
-          // 2. Remove cluster member role if held
-          if (cluster.discord_role_id && member.roles.cache.has(cluster.discord_role_id)) {
+          // 2. Remove cluster member role if held (only if not exclusively host revocation)
+          if (roleInCluster !== 'host' && cluster.discord_role_id && member.roles.cache.has(cluster.discord_role_id)) {
             await syncQueue.enqueueAsync('role_remove', `${member.id}:${cluster.discord_role_id}`, async () => {
               await member.roles.remove(cluster.discord_role_id);
             });
@@ -819,9 +861,9 @@ async function handleUserLinked(client, linkData) {
             continue;
           }
 
-          const guild = await getChapterGuild(client, cluster.chapter_id);
+          const guild = await getClusterGuild(client, cluster);
           if (!guild) {
-            throw new Error(`Guild for chapter ${cluster.chapter_id} not reachable`);
+            throw new Error(`Target guild for cluster ${cluster.name || clusterId} not reachable`);
           }
 
           const member = guild.members.cache.get(discordUserId) ||
@@ -928,7 +970,7 @@ async function handleClusterArchived(client, clusterData) {
 
     if (error || !cluster) return;
 
-    const guild = await getChapterGuild(client, cluster.chapter_id);
+    const guild = await getClusterGuild(client, cluster);
     if (guild) {
       let category = null;
       if (cluster.discord_category_id) {
@@ -1018,9 +1060,9 @@ async function reconcileClusterMembers(client, clusterId) {
       return result;
     }
 
-    const guild = await getChapterGuild(client, cluster.chapter_id);
+    const guild = await getClusterGuild(client, cluster);
     if (!guild) {
-      console.warn(`[reconcileClusterMembers] No chapter guild for cluster ${cluster.name} (${clusterId})`);
+      console.warn(`[reconcileClusterMembers] No target guild for cluster ${cluster.name} (${clusterId})`);
       return result;
     }
 
@@ -1049,25 +1091,34 @@ async function reconcileClusterMembers(client, clusterId) {
       return result;
     }
 
-    // 1. Fetch expected member user IDs from cluster_members table
-    const { data: dbMembers } = await supabase
-      .from('cluster_members')
-      .select('user_id, role_in_cluster')
-      .eq('cluster_id', cluster.id);
-
+    // 1. Fetch expected member user IDs from clusters.member_ids UUID[]
     const expectedUserIds = new Set();
     const hostUserIds = new Set();
 
-    if (dbMembers) {
-      for (const m of dbMembers) {
-        if (m.user_id) {
-          expectedUserIds.add(m.user_id);
-          if (m.role_in_cluster === 'host') {
-            hostUserIds.add(m.user_id);
+    if (Array.isArray(cluster.member_ids)) {
+      for (const mId of cluster.member_ids) {
+        if (mId) expectedUserIds.add(mId);
+      }
+    }
+
+    // Also support fallback query from cluster_members table if present
+    try {
+      const { data: dbMembers } = await supabase
+        .from('cluster_members')
+        .select('user_id, role_in_cluster')
+        .eq('cluster_id', cluster.id);
+
+      if (dbMembers) {
+        for (const m of dbMembers) {
+          if (m.user_id) {
+            expectedUserIds.add(m.user_id);
+            if (m.role_in_cluster === 'host') {
+              hostUserIds.add(m.user_id);
+            }
           }
         }
       }
-    }
+    } catch (_) {}
 
     // Also include cluster.leader_id if configured
     if (cluster.leader_id) {
@@ -1239,6 +1290,12 @@ async function syncCluster(client, clusterId) {
       return;
     }
 
+    const guild = await getClusterGuild(client, cluster);
+    if (!guild) {
+      console.warn(`[syncCluster] Target guild for cluster "${cluster.name || clusterId}" (access_mode: ${cluster.access_mode || 'invite'}, chapter: ${cluster.chapter_id}) is not provisioned or bot is not in guild. Skipping.`);
+      return;
+    }
+
     if (!cluster.discord_role_id || !cluster.discord_category_id) {
       await handleClusterCreated(client, cluster);
     }
@@ -1300,6 +1357,8 @@ module.exports = {
   getClusterEmoji,
   sanitizeChannelName,
   logSync,
+  getChapterGuild,
+  getClusterGuild,
   handleClusterCreated,
   handleMemberAdded,
   handleMemberRemoved,

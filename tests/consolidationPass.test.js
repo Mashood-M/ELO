@@ -11,6 +11,10 @@ const mockDb = {
   pending_discord_roles: [],
   discord_sync_log: [],
   discord_events_log: [],
+  clusters: [],
+  user_roles: [],
+  roles: [],
+  chapters: [],
 };
 
 function resetDb() {
@@ -21,6 +25,10 @@ function resetDb() {
   mockDb.pending_discord_roles = [];
   mockDb.discord_sync_log = [];
   mockDb.discord_events_log = [];
+  mockDb.clusters = [];
+  mockDb.user_roles = [];
+  mockDb.roles = [];
+  mockDb.chapters = [];
 }
 
 supabase.from = function (table) {
@@ -35,7 +43,10 @@ supabase.from = function (table) {
         const row = { id: item.id || `mock_uuid_${Math.random().toString(36).slice(2, 9)}`, ...item };
         currentTable.push(row);
       }
-      return Promise.resolve({ data: items, error: null });
+      return {
+        then: (onFulfilled, onRejected) =>
+          Promise.resolve({ data: items, error: null }).then(onFulfilled, onRejected),
+      };
     },
     update: (updates) => {
       return {
@@ -126,6 +137,8 @@ const config = require('../src/config');
 const { COMMAND_PERMISSIONS } = require('../src/lib/permissions');
 const codeVerification = require('../src/lib/codeVerification');
 const verifySessions = require('../src/lib/verifySessions');
+const api = require('../src/lib/api');
+const clusterSync = require('../src/lib/clusterSync');
 
 let totalTests = 0;
 let passedTests = 0;
@@ -258,6 +271,10 @@ async function runTests() {
     // Check transient and permanent messages
     assert(transientMsgSent.includes('Account verified and linked!'), 'Transient confirmation message should be sent');
     assert(welcomeMsgSent.includes('Welcome'), 'Permanent welcome message should be sent');
+
+    // Check audit log event inserted into discord_events_log
+    const auditEvent = mockDb.discord_events_log.find((e) => e.event_type === 'code_verification_success');
+    assert(auditEvent, 'Audit log event must be inserted on successful verification');
   });
 
   await itAsync('Section 1: Invalid code triggers immediate deletion, failure reply, and rate-limiting', async () => {
@@ -407,6 +424,91 @@ async function runTests() {
     sess.createdAt = Date.now() - (2 * 60 * 60 * 1000);
     const expiredSess = verifySessions.get('user_old');
     assert.strictEqual(expiredSess, null, 'Expired session must return null and be evicted');
+  });
+
+  // ==========================================================================
+  // SECTION 6: REGRESSION TESTS (Cluster Sync & Founder Role Sync)
+  // ==========================================================================
+  await itAsync('Section 6: syncCluster skips clusters with unprovisioned chapter guild gracefully', async () => {
+    resetDb();
+    mockDb.clusters.push({
+      id: 'cluster_unprov_1',
+      name: 'Cloud Computing',
+      chapter_id: 'chapter_no_guild',
+      discord_role_id: null,
+      discord_category_id: null,
+    });
+    const fakeClient = {
+      guilds: { cache: new Collection(), fetch: async () => null },
+    };
+    // Must complete gracefully without throwing or crashing
+    await clusterSync.syncCluster(fakeClient, 'cluster_unprov_1');
+    const cluster = mockDb.clusters.find((c) => c.id === 'cluster_unprov_1');
+    assert.strictEqual(cluster.discord_role_id, null, 'Cluster role should remain unprovisioned');
+  });
+
+  await itAsync('Section 6: syncUserAcrossGuilds does not remove ELEVATES • Founder from Founder or Guild Owner', async () => {
+    resetDb();
+    const founderOsId = 'founder_user_1';
+    const founderDiscordId = 'founder_discord_1';
+    mockDb.profiles.push({
+      id: founderOsId,
+      full_name: 'Founder Person',
+      role: 'founder',
+      discord_user_id: founderDiscordId,
+      discord_connected: true,
+    });
+
+    const founderRole = { id: 'role_founder', name: 'ELEVATES • Founder', editable: true };
+    const verifiedRole = { id: 'role_verified', name: 'Verified Member', editable: true };
+    const guildRoles = new Collection();
+    guildRoles.set(founderRole.id, founderRole);
+    guildRoles.set(verifiedRole.id, verifiedRole);
+
+    let removedRoles = [];
+    const memberRoles = new Set([founderRole.id]);
+    const mockMember = {
+      id: founderDiscordId,
+      displayName: 'Founder Person',
+      user: { tag: 'founder#0001' },
+      roles: {
+        cache: {
+          has: (id) => memberRoles.has(id),
+        },
+        add: async (r) => memberRoles.add(r.id),
+        remove: async (r) => {
+          removedRoles.push(r.name);
+          memberRoles.delete(r.id);
+        },
+      },
+      manageable: true,
+    };
+
+    mockDb.guild_config.push({
+      guild_id: config.mainGuildId,
+      guild_type: 'main',
+    });
+
+    const mockGuild = {
+      id: config.mainGuildId,
+      name: "Elevates's server",
+      ownerId: 'different_owner_id',
+      roles: { cache: guildRoles },
+      members: {
+        cache: new Collection([[founderDiscordId, mockMember]]),
+        fetch: async () => mockMember,
+      },
+    };
+
+    const mockClient = {
+      guilds: {
+        cache: new Collection([[config.mainGuildId, mockGuild]]),
+      },
+    };
+
+    await api.syncUserAcrossGuilds(mockClient, founderDiscordId, founderOsId);
+    assert(!removedRoles.includes('ELEVATES • Founder'), 'ELEVATES • Founder role must NOT be removed from founder');
+    assert(memberRoles.has(founderRole.id), 'Founder role must still be present on member');
   });
 
   console.log(`\n========================================`);

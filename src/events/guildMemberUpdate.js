@@ -40,7 +40,7 @@ module.exports = {
       for (const [, role] of addedRoles) {
         console.log(`[GuildMemberUpdate] Role "${role.name}" assigned to ${newMember.user.tag} in ${newMember.guild.name}`);
         if (chapterId) {
-          await api.logChapterEvent(
+          api.logChapterEvent(
             newMember.client,
             chapterId,
             newMember.guild.id,
@@ -60,7 +60,7 @@ module.exports = {
       for (const [, role] of removedRoles) {
         console.log(`[GuildMemberUpdate] Role "${role.name}" removed from ${newMember.user.tag} in ${newMember.guild.name}`);
         if (chapterId) {
-          await api.logChapterEvent(
+          api.logChapterEvent(
             newMember.client,
             chapterId,
             newMember.guild.id,

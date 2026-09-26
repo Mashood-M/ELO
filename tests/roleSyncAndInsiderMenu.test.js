@@ -152,14 +152,14 @@ async function runTests() {
   // --------------------------------------------------------------------------
   // 1. CONFIGURATION & ROLE DEFINITIONS
   // --------------------------------------------------------------------------
-  it('config: defines executiveMember role name and maps to Verified Member in main server', () => {
+  it('config: defines executiveMember role name and maps to Executive Member in main server', () => {
     assert.strictEqual(typeof config.roles.executiveMember, 'string');
     assert.strictEqual(config.roles.executiveMember, 'Executive Member');
 
     const mapping = config.mainRoles.roleMapping;
-    assert.strictEqual(mapping['executive_member'], 'Verified Member');
-    assert.strictEqual(mapping['exec_member'], 'Verified Member');
-    assert.strictEqual(mapping['executive'], 'Verified Member');
+    assert.strictEqual(mapping['executive_member'], 'Executive Member');
+    assert.strictEqual(mapping['exec_member'], 'Executive Member');
+    assert.strictEqual(mapping['executive'], 'Executive Member');
   });
 
   // --------------------------------------------------------------------------

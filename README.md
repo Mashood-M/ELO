@@ -22,8 +22,15 @@ The bot communicates directly with Supabase via the service-role key (no interme
   - Assigns chapter roles matching the OS roles schema (Campus Lead, Class Representative, Student Member, Faculty Coordinator, etc.). Roles are generated per chapter, not shared globally.
   - Automatically updates the member's server nickname to match their OS `full_name`.
   - Grants the verified member role (`ELEVATES • Member`) and revokes unverified (`elevates`) or guest roles.
+- **Executive Member Role Sync**:
+  - Monitors `user_roles` in Realtime for rows where `role_key = 'executive_member'`.
+  - **On Insert**: Automatically creates the "Executive Member" Discord role (color: `#3B82F6`) in that chapter's server if it does not already exist, and assigns it to the user.
+  - **On Removal / Handover**: When the `user_roles` row is deleted, a handover occurs, or the user is demoted, the bot immediately revokes the "Executive Member" role in Discord.
+  - *Context on `is_permanent`*: In the ElevatesOS schema, `user_roles.is_permanent = true` for `executive_member` rows. This column relates strictly to internal OS term logic; removal in Discord is driven purely by whether the matching `user_roles` row currently exists.
 - **Handling Chapter Transitions**: If a member's chapter assignment changes in ElevatesOS, the bot automatically strips chapter roles from the previous chapter server and grants access in the new one.
 - **Resilient Sync Queue (`SyncQueue`)**:
+  - Multi-worker priority queue (`maxConcurrency = 3`, `minDelayMs = 25ms`).
+  - High priority for interactive role updates, webhooks, and realtime events; background low priority for startup reconciliation.
   - Changes are enqueued and rate-limited to avoid Discord API rate limits (HTTP 429).
   - Automatically handles 429 backoff with dynamic exponential wait times based on Discord's `retry_after` headers.
   - In-flight and pending task deduplication ensures smooth processing during bulk organizational changes (such as term transitions).
@@ -66,19 +73,15 @@ The bot communicates directly with Supabase via the service-role key (no interme
 - **Centralized Event Router**: `api.logChapterEvent` automatically maps event types and routes rich embed notifications into the appropriate chapter thread in the Main Server and to the local server's `#mod-log`.
 
 ### 5. Production-Grade Cluster Synchronization System
-The bot features a complete, resilient synchronization engine between Supabase and Discord for chapter clusters:
+The bot features a complete, resilient synchronization engine between Supabase and Discord for clusters, incorporating dynamic server placement by `access_mode` and direct array-diff membership synchronization:
 
 #### Database Schema
-- **`clusters`** (extended):
+- **`clusters`**:
+  - `access_mode` (TEXT): Determines target guild placement (`'open'` -> Main Server, `'invite'`/closed -> Chapter Server).
+  - `member_ids` (UUID[]): Direct array of member UUIDs (replaces previous join-table assumption).
+  - `leader_id` (UUID nullable): Cluster Host / Leader profile ID.
   - `discord_category_id` (TEXT, nullable): ID of the private Discord category.
   - `discord_role_id` (TEXT, nullable): ID of the cluster member Discord role.
-- **`cluster_members`** (membership & roles):
-  - `id` (UUID PK): Unique membership identifier.
-  - `cluster_id` (UUID FK -> `clusters`): Target cluster.
-  - `user_id` (UUID FK -> `profiles`): Target user profile.
-  - `added_by` (UUID FK -> `profiles`, nullable): Profile that added the member.
-  - `added_at` (TIMESTAMPTZ): Timestamp when member was added.
-  - `role_in_cluster` (TEXT, `'member'` | `'host'`): Role within the cluster.
 - **`pending_discord_roles`** (deferred role assignment):
   - `id` (UUID PK): Unique pending role identifier.
   - `user_id` (UUID FK -> `profiles`): User awaiting role assignment.
@@ -96,32 +99,48 @@ The bot features a complete, resilient synchronization engine between Supabase a
   - `error_message` (TEXT nullable): Error details if operation failed.
   - `created_at` (TIMESTAMPTZ): Audit timestamp.
 
+#### Dynamic Placement by `access_mode`
+- **`access_mode = 'open'`**:
+  - The private category, `<Cluster Name> Member` role, and child channels are created in the **Elevates Main Server** (confirmed via `guild_config` where `guild_type = 'main'`, fallback `MAIN_GUILD_ID`).
+- **`access_mode = 'invite'` (or closed)**:
+  - Created in the specific **Chapter Server** that `clusters.chapter_id` maps to.
+- Both paths reuse the exact same creation sequence: role creation with immediate ID write-back, category with permission overwrites, child channels, and `discord_category_id` write-back.
+
+#### Membership Sync via Array Diffing (`clusters.member_ids`)
+There is no separate `cluster_members` join table — membership lives as `clusters.member_ids UUID[]` directly on the `clusters` row. The bot monitors `clusters` UPDATE events in Supabase Realtime (with `REPLICA IDENTITY FULL` enabled):
+- **User present in `NEW.member_ids` but not in `OLD.member_ids`**: Treated as a member addition:
+  - If user is linked and present in the target guild: grants the cluster role immediately.
+  - If user is unlinked or not yet in the target guild: queues into `pending_discord_roles`.
+- **User present in `OLD.member_ids` but not in `NEW.member_ids`**: Treated as a member removal:
+  - Revokes the cluster role in the target guild.
+  - Deletes any matching row in `pending_discord_roles`.
+- **Host Role Diffing (`clusters.leader_id`)**: Compares `OLD.leader_id` against `NEW.leader_id` on UPDATE to assign the `<Cluster Name> Host` role to the new leader and revoke it from the former leader.
+
 #### Event Flow & Lifecycle
 
 ```
 [Supabase Event]
        │
        ├── clusters (INSERT) ──────────► handleClusterCreated
-       │                                     1. Create '<Name> Member' role
-       │                                     2. Immediately UPDATE clusters.discord_role_id
+       │                                     1. Resolve target guild (Main server if access_mode='open', else Chapter server)
+       │                                     2. Create '<Name> Member' role & immediately UPDATE clusters.discord_role_id
        │                                     3. Create private category with permission overwrites
        │                                     4. Create child channels (#announcements, #discussion, #resources, #challenges, #projects, Voice)
        │                                     5. UPDATE clusters.discord_category_id & log to discord_sync_log
+       │                                     6. Initial role grant for any pre-populated member_ids and leader_id
        │
        ├── clusters (UPDATE: archived) ─► handleClusterArchived
        │                                     1. Rename category to '[ARCHIVED] <Name>'
        │                                     2. Reject auto-assignment for new members
        │                                     3. Preserve channels & roles for 30-day grace period
        │
-       ├── cluster_members (INSERT) ───► handleMemberAdded
-       │                                     ├── Cluster archived? ──► Reject & log invalid
-       │                                     ├── User linked & in guild? ──► Grant role (idempotent)
-       │                                     └── Not linked or not in guild? ──► INSERT into pending_discord_roles
+       ├── clusters (UPDATE: member_ids)► Array Diffing:
+       │                                     ├── User in NEW but not OLD ──► handleMemberAdded (grant role or queue pending)
+       │                                     └── User in OLD but not NEW ──► handleMemberRemoved (revoke role & delete pending)
        │
-       ├── cluster_members (DELETE) ───► handleMemberRemoved
-       │                                     1. Revoke Discord role if held
-       │                                     2. CRITICAL: DELETE matching pending_discord_roles row
-       │                                     3. Log revocation outcome
+       ├── clusters (UPDATE: leader_id) ─► Leader Diffing:
+       │                                     ├── New leader assigned ──► Grant '<Name> Host' role
+       │                                     └── Old leader removed ──► Revoke '<Name> Host' role
        │
        └── discord_links (INSERT/linked) ► handleUserLinked
                                              1. Query pending_discord_roles for user
@@ -138,9 +157,9 @@ The bot features a complete, resilient synchronization engine between Supabase a
 - Role assignments check `member.roles.cache.has(roleId)` first to skip redundant API requests.
 
 #### Role Reconciliation & Drift Correction
-A built-in reconciliation engine compares `cluster_members` in Supabase against actual Discord role holders in that cluster's role:
+A built-in reconciliation engine compares `clusters.member_ids` (and `leader_id`) in Supabase against actual Discord role holders in that cluster's role:
 - **Grants missing roles**: Members linked in Supabase who do not currently hold the cluster role.
-- **Revokes excess roles**: Discord members holding the cluster role who are no longer in `cluster_members`.
+- **Revokes excess roles**: Discord members holding the cluster role who are no longer present in `clusters.member_ids`.
 - **Logs all corrections**: Every drift correction is audited in `discord_sync_log` under `reconciliation_drift_corrected`.
 
 ##### Triggering Reconciliation Manually
@@ -190,11 +209,35 @@ Permissions are enforced using an OS-driven permission matrix (`src/lib/permissi
 |---|---|---|
 | **Founder / HQ Admin** | Full access (`*`) | Full access (`*`) oversight |
 | **Campus Lead** | `/chapter` | Full server moderation + `/task-new` + `Mark Task Complete` across all chapter clusters |
+| **Executive Member** | None | Per-person delegated moderation subset via `term_members.permissions` (e.g. `/kick`, `/ban`, `/mute`, `/warn`, `/unlink`, `/announce`, `/reply-as-bot`) |
 | **Cluster Host** | None | Scoped cluster task management: `/task-new` & `Mark Task Complete` in own cluster |
 | **Class Representative** | None | Moderation: `/kick`, `/mute`, `/warn`, `/warnings` (no ban/unban/unlink) |
 | **Student Member** | None | Member commands: `/cluster` |
 
-### 8. Two-Way DM Support & Modmail System
+### 8. Per-Person Delegated Permissions System
+Replaces the flat "Tier B" assumption with granular, per-person permission delegation:
+- **Schema Source (`term_members.permissions TEXT[]`)**:
+  - Executive members (`role_key = 'executive_member'`) can be delegated an individual subset of Campus-Lead-equivalent powers in their chapter (e.g., `['kick', 'warn']` for one person, `['ban', 'unban']` for another, `['announce']` for a communications lead).
+  - Permissions are retrieved by joining the chapter's currently active term (`terms.status = 'active'`) and querying `term_members.permissions` for the member's OS `user_id`.
+- **Campus Lead Full Access Retained**:
+  - Campus Leads retain full, unrestricted access to all chapter moderation commands regardless of any array contents. The array is solely used to delegate a subset of powers to executive members, never to restrict Campus Leads.
+- **Live Command-Time Verification & Realtime Cache Invalidation**:
+  - Because permissions can be modified at any moment in ElevatesOS by a Campus Lead, permissions are verified live at command execution time (`canUserExecuteCommand` calling `getUserDelegatedPermissions`).
+  - Short-lived caching (`60s` TTL) is combined with instant Realtime cache invalidation listeners on `terms` and `term_members` UPDATE/INSERT/DELETE events.
+- **Centralized Command-to-Permission Mapping (`src/config.js`)**:
+  Moderation commands are mapped to discrete permission strings via `config.delegatedPermissions`:
+  - `/ban` ➔ `'ban'`
+  - `/unban` ➔ `'unban'`
+  - `/unlink` ➔ `'unlink'`
+  - `/kick` ➔ `'kick'`
+  - `/mute` ➔ `'mute'`
+  - `/warn` ➔ `'warn'`
+  - `/warnings` ➔ `'warn'`
+  - `/announce` ➔ `'announce'`
+  - `/reply-as-bot` ➔ `'reply-as-bot'`
+  - `/clear` ➔ `'clear'`
+
+### 9. Two-Way DM Support & Modmail System
 - **Private Staff Forum (`#user-dm-support`)**: Auto-created in the Main Server, visible strictly to Founders, HQ Admins, and the bot.
 - **Permanent Mailbox Threads**: Direct messages sent to the bot (excluding active account verification sessions) automatically route into a dedicated, permanent forum thread titled with the member's Discord and ElevatesOS name.
 - **Database Tracking (`dm_threads`)**: Maps each `discord_user_id` to their permanent `forum_thread_id` and tracks conversation status (`open` | `closed`).
@@ -208,7 +251,7 @@ Permissions are enforced using an OS-driven permission matrix (`src/lib/permissi
   - Future DMs from that user automatically unarchive and reopen the existing thread with a `🔄 Conversation reopened` notice rather than creating duplicates.
 - **First-Message Welcome**: Only the first message of a new or reopened conversation sends an automated acknowledgment to avoid repetitive spam.
 
-### 9. Preserved Features
+### 10. Preserved Features
 - **`/cluster`**: Displays member count and directory of linked chapter members.
 - **`/create-cluster`**: Opens public discussion forum threads in the Main Server.
 - **Welcome Card Generation**: 800x300 canvas image generated and posted to `#general-chat` upon account verification.
@@ -248,6 +291,7 @@ Permissions are enforced using an OS-driven permission matrix (`src/lib/permissi
    - `20260924000000_discord_tickets.sql`
    - `20260925000000_term_handover_logs.sql`
    - `20260925010000_cluster_sync_system.sql`
+   - `20260926000000_cluster_replica_identity_and_delegated_perms.sql`
 
 4. **Register Commands & Context Menus:**
    ```bash
@@ -271,15 +315,65 @@ Permissions are enforced using an OS-driven permission matrix (`src/lib/permissi
 | `/task-new` | Slash | Chapter Server | Cluster Host / Campus Lead | Creates a weekly task in the cluster's `#challenges` forum |
 | **Mark Task Complete** | Message App | Task Thread | Cluster Host / Campus Lead | Toggles task completion for message author with ✅ reaction |
 | `/create-cluster` | Slash | Main Server | Staff / Lead | Starts an open community discussion thread in `#doubts-and-help` |
-| `/kick <member> [reason]` | Slash | Chapter Server | Campus Lead, Class Rep, Founder | Kicks a member from the server |
-| `/ban <member> [reason] [days]` | Slash | Chapter Server | Campus Lead, Founder | Bans a member from the server |
-| `/unban <user_id>` | Slash | Chapter Server | Campus Lead, Founder | Unbans a user by their Discord User ID |
-| `/mute <member> <duration> [reason]` | Slash | Chapter Server | Campus Lead, Class Rep, Founder | Times out a member (e.g. `10m`, `2h`, `1d`) |
-| `/warn <member> <reason>` | Slash | Chapter Server | Campus Lead, Class Rep, Founder | Logs an official moderation warning |
-| `/warnings <member>` | Slash | Chapter Server | Campus Lead, Class Rep, Founder | Views a member's warning history |
-| `/unlink <member>` | Slash | Chapter Server | Campus Lead, Founder | Force-unlinks an account from ElevatesOS |
-| `/announce <channel> <message>` | Slash | Chapter / Main | Campus Lead (chapter), Founder | Broadcasts an announcement |
-| `/reply-as-bot <msg_id> <text>` | Slash | Chapter / Main | Campus Lead (chapter), Founder | Replies to a channel message as the bot |
-| `/clear <password> [amount] [user]` | Slash | Any Server | Password Authorized (`mashood`) | Bulk deletes messages in the current channel |
+| `/kick <member> [reason]` | Slash | Chapter Server | Campus Lead, Executive Member (delegated `'kick'`), Class Rep, Founder | Kicks a member from the server |
+| `/ban <member> [reason] [days]` | Slash | Chapter Server | Campus Lead, Executive Member (delegated `'ban'`), Founder | Bans a member from the server |
+| `/unban <user_id>` | Slash | Chapter Server | Campus Lead, Executive Member (delegated `'unban'`), Founder | Unbans a user by their Discord User ID |
+| `/mute <member> <duration> [reason]` | Slash | Chapter Server | Campus Lead, Executive Member (delegated `'mute'`), Class Rep, Founder | Times out a member (e.g. `10m`, `2h`, `1d`) |
+| `/warn <member> <reason>` | Slash | Chapter Server | Campus Lead, Executive Member (delegated `'warn'`), Class Rep, Founder | Logs an official moderation warning |
+| `/warnings <member>` | Slash | Chapter Server | Campus Lead, Executive Member (delegated `'warn'`), Class Rep, Founder | Views a member's warning history |
+| `/unlink <member>` | Slash | Chapter Server | Campus Lead, Executive Member (delegated `'unlink'`), Founder | Force-unlinks an account from ElevatesOS |
+| `/announce <channel> <message>` | Slash | Chapter / Main | Campus Lead (chapter), Executive Member (delegated `'announce'`), Founder | Broadcasts an announcement |
+| `/reply-as-bot <msg_id> <text>` | Slash | Chapter / Main | Campus Lead (chapter), Executive Member (delegated `'reply-as-bot'`), Founder | Replies to a channel message as the bot |
+| `/clear <password> [amount] [user]` | Slash | Any Server | Password Authorized (`mashood`), Executive Member (delegated `'clear'`) | Bulk deletes messages in the current channel |
 | **Close Ticket** | Message App | Support Thread | Lane Authorized Staff | Closes and archives the user support ticket |
 | `/close-ticket` | Slash | Support Thread | Lane Authorized Staff | Closes and archives the user support ticket |
+
+---
+
+## Utility Scripts
+
+These stand-alone utility scripts are manual administrative tools designed for maintenance and configuration; they are **not** part of the bot's regular startup or runtime.
+
+### 1. Main Server Channel Visibility Permissions (`scripts/apply-main-server-permissions.js`)
+
+Enforces category-level channel visibility permissions across the Elevates Main Server per the agreed architectural structure:
+- **`@everyone`**: `ViewChannel` allowed **only** on the `"01 • Start Here"` category (and denied on all other categories server-wide).
+- **`Verified Member`**: `ViewChannel` allowed on all public categories (`02 • Elevates Community`, `03 • Discover Elevates`, `04 • Open Events`, `05 • Open Clusters`, `06 • Global Projects`, `07 • Global Opportunities`, `08 • Elevates Network`, `09 • ELO`, and `Community Voice`).
+- **Locked Categories**: (`10 • Founders HQ`, `11 • HQ Operations`, `12 • Community Management`, `13 • Chapter Management`, `14 • Cluster Management`, `15 • Private Projects`, `Chapter Logs`, `Founder Tickets`, `Admin Tickets`): Restricted to `Founder` and `HQ Admin` only; denied to all others (including `Verified Member`).
+- **`Unverified`**: Status-tracking role only; receives no special permission overwrites anywhere.
+- **Child Channel Inheritance**: Checks all child channels under each category and resets any explicit, desynced overwrites (`lockPermissions()`) so channels inherit cleanly from their parent category without unexpected overrides.
+- **Resilient Role Resolution**: Looks up roles by exact name (`@everyone`, `Verified Member`, `Founder`, `HQ Admin`) and gracefully warns and skips any missing roles without crashing.
+
+#### Commands:
+
+- **Dry-run mode** (scans categories, roles, and child channels, printing planned changes without modifying Discord):
+  ```bash
+  node scripts/apply-main-server-permissions.js
+  ```
+
+- **Confirm mode** (applies category permission overwrites and locks desynced child channels):
+  ```bash
+  node scripts/apply-main-server-permissions.js --confirm
+  ```
+
+- Optional `--guild-id` flag to target a specific server:
+  ```bash
+  node scripts/apply-main-server-permissions.js --confirm --guild-id <MAIN_GUILD_ID>
+  ```
+
+### 2. Main Server Role Cleanup (`scripts/cleanup-main-server-roles.js`)
+
+Cleans up extraneous and obsolete roles from the Elevates Main Server, preserving only allowed operational roles (`Founder`, `HQ Admin`, `Community Manager`, `Campus Lead`, `Class Rep`, `Verified Member`, `Guest`, `Unverified`), Discord base `@everyone`, and bot integration roles.
+
+#### Commands:
+
+- **Dry-run mode**:
+  ```bash
+  node scripts/cleanup-main-server-roles.js
+  ```
+
+- **Confirm mode**:
+  ```bash
+  node scripts/cleanup-main-server-roles.js --confirm
+  ```
+

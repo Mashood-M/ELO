@@ -86,8 +86,7 @@ function recordFailedAttempt(discordUserId) {
           },
           created_at: new Date().toISOString(),
         })
-        .then(() => {})
-        .catch(() => {});
+        .then(() => {}, () => {});
     } catch (_) {}
   }
 }
@@ -263,20 +262,21 @@ async function handleLinkServerMessage(message) {
     }
 
     // Audit log linking
-    await supabase
-      .from('discord_events_log')
-      .insert({
-        guild_id: message.guild.id,
-        discord_user_id: discordUserId,
-        os_user_id: osUserId,
-        event_type: 'code_verification_success',
-        detail: {
-          code_id: codeRow.id,
-          username: message.author.tag,
-        },
-        created_at: now,
-      })
-      .catch(() => {});
+    try {
+      await supabase
+        .from('discord_events_log')
+        .insert({
+          guild_id: message.guild.id,
+          discord_user_id: discordUserId,
+          os_user_id: osUserId,
+          event_type: 'code_verification_success',
+          detail: {
+            code_id: codeRow.id,
+            username: message.author.tag,
+          },
+          created_at: now,
+        });
+    } catch (_) {}
 
     return true;
   } catch (err) {

@@ -13,6 +13,18 @@ const chapterForumCache = new Map();
 const guildConfigCache = new Map(); // guildId -> { data, cachedAt }
 const GUILD_CONFIG_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
+// In-memory cache for official OS roles to eliminate redundant database queries
+let cachedOsRoles = null;
+let cachedOsRolesAt = 0;
+const OS_ROLES_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// In-memory cache for term_members delegated permissions (key: `${chapterId}:${userId}` -> { permissions: string[], cachedAt: number })
+const delegatedPermissionsCache = new Map();
+const DELEGATED_PERMS_TTL_MS = 60 * 1000; // 60 seconds fallback TTL
+
+// In-memory debounce timers for chapter live roster updates (chapterId -> Timeout)
+const rosterDebounceTimers = new Map();
+
 // Periodic cleanup of stale inMemorySetupTokens and guildConfigCache (Section 5.6)
 setInterval(() => {
   const now = Date.now();
@@ -314,6 +326,22 @@ module.exports = {
         .select('*, roles(name, key)')
         .eq('user_id', profile.id);
 
+      let discordUserId = profile.discord_user_id;
+      if (!discordUserId) {
+        try {
+          const { data: link } = await supabase
+            .from('discord_links')
+            .select('discord_user_id')
+            .eq('os_user_id', profile.id)
+            .order('updated_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (link?.discord_user_id) {
+            discordUserId = link.discord_user_id;
+          }
+        } catch (_) {}
+      }
+
       return {
         profile,
         userRoles: userRoles || [],
@@ -321,7 +349,7 @@ module.exports = {
         chapterId: profile.chapter_id,
         name: profile.full_name || 'Member',
         elevatesId: profile.elevates_id,
-        discord_user_id: profile.discord_user_id,
+        discord_user_id: discordUserId,
         discord_connected: Boolean(profile.discord_connected),
       };
     } catch (err) {
@@ -331,18 +359,118 @@ module.exports = {
   },
 
   /**
-   * Fetches all official roles defined in the roles table.
+   * Fetches all official roles defined in the roles table (cached with TTL).
+   * @param {boolean} [forceRefresh=false]
    */
-  async getAllOsRoles() {
+  async getAllOsRoles(forceRefresh = false) {
+    const now = Date.now();
+    if (!forceRefresh && cachedOsRoles && (now - cachedOsRolesAt < OS_ROLES_TTL_MS)) {
+      return cachedOsRoles;
+    }
     try {
       const { data, error } = await supabase.from('roles').select('*');
       if (error) {
         console.error('[getAllOsRoles] Error fetching roles:', error.message);
-        return [];
+        if (!cachedOsRoles) {
+          cachedOsRoles = [];
+          cachedOsRolesAt = now;
+        }
+        return cachedOsRoles;
       }
-      return data || [];
+      cachedOsRoles = data || [];
+      cachedOsRolesAt = now;
+      return cachedOsRoles;
     } catch (err) {
       console.error('[getAllOsRoles] Failed:', err);
+      if (!cachedOsRoles) {
+        cachedOsRoles = [];
+        cachedOsRolesAt = now;
+      }
+      return cachedOsRoles;
+    }
+  },
+
+  /**
+   * Invalidate OS roles cache on table updates.
+   */
+  invalidateOsRolesCache() {
+    cachedOsRoles = null;
+    cachedOsRolesAt = 0;
+  },
+
+  /**
+   * Invalidates cached delegated permissions.
+   * If chapterId or userId provided, invalidates matching entries, otherwise clears all.
+   *
+   * @param {string} [chapterId]
+   * @param {string} [userId]
+   */
+  invalidateTermMembersCache(chapterId = null, userId = null) {
+    if (chapterId && userId) {
+      delegatedPermissionsCache.delete(`${chapterId}:${userId}`);
+    } else if (chapterId) {
+      for (const key of delegatedPermissionsCache.keys()) {
+        if (key.startsWith(`${chapterId}:`)) delegatedPermissionsCache.delete(key);
+      }
+    } else if (userId) {
+      for (const key of delegatedPermissionsCache.keys()) {
+        if (key.endsWith(`:${userId}`)) delegatedPermissionsCache.delete(key);
+      }
+    } else {
+      delegatedPermissionsCache.clear();
+    }
+  },
+
+  /**
+   * Fetches delegated permissions for an executive member in a chapter for its active term.
+   *
+   * @param {string} chapterId - Chapter ID
+   * @param {string} userId - User ID (profile.id)
+   * @param {boolean} [forceRefresh=false]
+   * @returns {Promise<string[]>} Array of permission strings (e.g. ['kick', 'warn', 'ban'])
+   */
+  async getUserDelegatedPermissions(chapterId, userId, forceRefresh = false) {
+    if (!chapterId || !userId) return [];
+    const cacheKey = `${chapterId}:${userId}`;
+    const cached = delegatedPermissionsCache.get(cacheKey);
+    if (!forceRefresh && cached && (Date.now() - cached.cachedAt < DELEGATED_PERMS_TTL_MS)) {
+      return cached.permissions;
+    }
+
+    try {
+      // 1. Resolve active term for this chapter
+      const { data: activeTerm, error: termErr } = await supabase
+        .from('terms')
+        .select('id')
+        .eq('chapter_id', chapterId)
+        .eq('status', 'active')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (termErr || !activeTerm) {
+        delegatedPermissionsCache.set(cacheKey, { permissions: [], cachedAt: Date.now() });
+        return [];
+      }
+
+      // 2. Query term_members row for this user in the active term
+      const { data: memberRow, error: memberErr } = await supabase
+        .from('term_members')
+        .select('permissions')
+        .eq('term_id', activeTerm.id)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (memberErr || !memberRow) {
+        delegatedPermissionsCache.set(cacheKey, { permissions: [], cachedAt: Date.now() });
+        return [];
+      }
+
+      const permissions = Array.isArray(memberRow.permissions) ? memberRow.permissions : [];
+      delegatedPermissionsCache.set(cacheKey, { permissions, cachedAt: Date.now() });
+      return permissions;
+    } catch (err) {
+      console.warn(`[getUserDelegatedPermissions] Error fetching permissions for user ${userId} in chapter ${chapterId}:`, err.message);
       return [];
     }
   },
@@ -611,6 +739,19 @@ module.exports = {
       };
     } catch (err) {
       throw formatError(err, 'Failed to configure server');
+    }
+  },
+
+  /**
+   * Invalidates cached guild configuration.
+   *
+   * @param {string} [guildId] Specific guild ID to invalidate, or null to clear all.
+   */
+  invalidateGuildConfigCache(guildId = null) {
+    if (guildId) {
+      guildConfigCache.delete(guildId);
+    } else {
+      guildConfigCache.clear();
     }
   },
 
@@ -1809,9 +1950,22 @@ module.exports = {
    * Updates the live roster in the 👥 Current Roles topic for a chapter.
    * Keeps an official pinned embed updated with Campus Lead, Class Reps, Core Team, etc.
    */
-  async updateChapterCurrentRolesTopic(client, chapterId, targetThread = null) {
+  async updateChapterCurrentRolesTopic(client, chapterId, targetThread = null, immediate = false) {
     try {
       if (!client || !chapterId) return;
+
+      if (!targetThread && !immediate) {
+        if (rosterDebounceTimers.has(chapterId)) {
+          clearTimeout(rosterDebounceTimers.get(chapterId));
+        }
+        return new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            rosterDebounceTimers.delete(chapterId);
+            this.updateChapterCurrentRolesTopic(client, chapterId, null, true).then(resolve).catch(resolve);
+          }, 1500);
+          rosterDebounceTimers.set(chapterId, timer);
+        });
+      }
 
       // 1. Fetch chapter details
       const chapter = await this.getChapterByIdentifier(chapterId);
@@ -2403,10 +2557,21 @@ module.exports = {
    * Synchronizes a user's Discord role and profile state across all guilds.
    * Runs through syncQueue to prevent Discord 429 rate limits.
    */
-  async syncUserAcrossGuilds(client, discordUserId, osUserId = null) {
+  async syncUserAcrossGuilds(client, discordUserId, osUserId = null, removedRoleKey = null, priority = 'high') {
     if (!client || (!discordUserId && !osUserId)) return;
 
-    syncQueue.enqueue('user', discordUserId || osUserId, async () => {
+    return syncQueue.enqueue('user', discordUserId || osUserId, async () => {
+      const targetChaptersToUpdate = new Set();
+      const removedRoleKeys = new Set();
+      if (removedRoleKey) {
+        const keys = Array.isArray(removedRoleKey) ? removedRoleKey : [removedRoleKey];
+        for (const k of keys) {
+          if (typeof k === 'string' && k.trim()) {
+            removedRoleKeys.add(k.toLowerCase().trim());
+          }
+        }
+      }
+
       let identity = null;
       if (discordUserId) {
         identity = await this.getIdentityByDiscordId(discordUserId);
@@ -2416,7 +2581,25 @@ module.exports = {
       }
 
       const profile = identity?.profile || null;
-      const targetDiscordId = discordUserId || profile?.discord_user_id || identity?.discord_user_id;
+      let targetDiscordId = discordUserId || profile?.discord_user_id || identity?.discord_user_id;
+
+      // Fallback: If targetDiscordId is missing but osUserId is provided, check discord_links
+      if (!targetDiscordId && osUserId) {
+        try {
+          const { data: linkRow } = await supabase
+            .from('discord_links')
+            .select('discord_user_id')
+            .eq('os_user_id', osUserId)
+            .order('updated_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (linkRow?.discord_user_id) {
+            targetDiscordId = linkRow.discord_user_id;
+          }
+        } catch (_) {}
+      }
+
       if (!targetDiscordId) return;
 
       const isConnected = Boolean(
@@ -2437,14 +2620,21 @@ module.exports = {
         } catch (_) {}
 
         if (!member) continue;
+        if (guild.ownerId && member.id === guild.ownerId) continue;
+        if (member.manageable === false) continue;
 
         const guildConfig = await this.getGuildConfig(guild.id);
         const guildType = guildConfig?.guildType || 'chapter';
         const guildChapterId = guildConfig?.chapterId;
 
-        const verifiedRole = guild.roles.cache.find(
-          (r) => !r.managed && r.name.toLowerCase() === (config.roles.verified || 'ELEVATES • Member').toLowerCase()
+        const verifiedRoles = guild.roles.cache.filter(
+          (r) => !r.managed && (
+            r.name.toLowerCase() === (config.roles.verified || 'ELEVATES • Member').toLowerCase() ||
+            r.name.toLowerCase() === 'verified member' ||
+            r.name.toLowerCase() === 'elevates • member'
+          )
         );
+        const verifiedRole = verifiedRoles.first() || null;
         const unverifiedRole = guild.roles.cache.find(
           (r) => !r.managed && (
             r.name.toLowerCase() === 'unverified' ||
@@ -2472,43 +2662,108 @@ module.exports = {
             if (userRoles && userRoles.length > 0) {
               for (const r of userRoles) {
                 const k = (r.role_key || r.role || '').toLowerCase().trim();
-                if (k) userRoleKeys.add(k);
-                if (r.roles?.name) userRoleNames.add(r.roles.name.trim());
-                if (r.roles?.key) userRoleKeys.add(r.roles.key.toLowerCase().trim());
+                if (k && !removedRoleKeys.has(k)) userRoleKeys.add(k);
+                if (r.roles?.name && (!r.roles?.key || !removedRoleKeys.has(r.roles.key.toLowerCase().trim()))) {
+                  userRoleNames.add(r.roles.name.trim());
+                }
+                if (r.roles?.key && !removedRoleKeys.has(r.roles.key.toLowerCase().trim())) {
+                  userRoleKeys.add(r.roles.key.toLowerCase().trim());
+                }
               }
             } else {
               // Fallback only when user has NO assigned records in user_roles
               if (profile.designation) {
-                userRoleKeys.add(profile.designation.toLowerCase().trim());
+                const des = profile.designation.toLowerCase().trim();
+                if (!removedRoleKeys.has(des)) userRoleKeys.add(des);
               }
               if (profile.role) {
-                userRoleKeys.add(profile.role.toLowerCase().trim());
+                const rol = profile.role.toLowerCase().trim();
+                if (!removedRoleKeys.has(rol)) userRoleKeys.add(rol);
               }
             }
 
-            // High-level administrative roles directly from profile if assigned
-            if (profile.role && ['founder', 'hq_admin', 'admin'].includes(profile.role.toLowerCase().trim())) {
-              userRoleKeys.add(profile.role.toLowerCase().trim());
+            // High-level administrative roles directly from profile if assigned, but only if not explicitly removed
+            if (profile.role) {
+              const rol = profile.role.toLowerCase().trim();
+              if (['founder', 'hq_admin', 'admin'].includes(rol) && !removedRoleKeys.has(rol)) {
+                if (!userRoles || userRoles.length === 0 || userRoleKeys.has(rol)) {
+                  userRoleKeys.add(rol);
+                }
+              }
+            }
+            if (profile.designation) {
+              const des = profile.designation.toLowerCase().trim();
+              if (['founder', 'hq_admin', 'admin'].includes(des) && !removedRoleKeys.has(des)) {
+                if (!userRoles || userRoles.length === 0 || userRoleKeys.has(des)) {
+                  userRoleKeys.add(des);
+                }
+              }
             }
 
-            // Check if user is campus_lead for ANY chapter in chapters table
-            try {
-              const { data: leadChapters } = await supabase
-                .from('chapters')
-                .select('id')
-                .eq('campus_lead_id', profile.id)
-                .limit(1);
-              if (leadChapters && leadChapters.length > 0) {
-                userRoleKeys.add('campus_lead');
-                userRoleNames.add('Campus Lead');
-              }
-            } catch (_) {}
+            // Check if user is campus_lead for ANY chapter in chapters table (unless explicitly removed)
+            if (!removedRoleKeys.has('campus_lead')) {
+              try {
+                const { data: leadChapters } = await supabase
+                  .from('chapters')
+                  .select('id')
+                  .eq('campus_lead_id', profile.id)
+                  .limit(1);
+                if (leadChapters && leadChapters.length > 0) {
+                  userRoleKeys.add('campus_lead');
+                  userRoleNames.add('Campus Lead');
+                }
+              } catch (_) {}
+            }
 
             // Map each OS role to the main server fixed role
             for (const rKey of userRoleKeys) {
               const mapped = config.mainRoles.getMainRoleForOsRole(rKey);
               if (mapped) {
                 targetRoleNames.add(mapped);
+              }
+            }
+
+            // Normalize aliases in targetRoleNames
+            if (targetRoleNames.has('Founder') || targetRoleNames.has('ELEVATES • Founder') || userRoleKeys.has('founder')) {
+              targetRoleNames.add('Founder');
+              targetRoleNames.add('ELEVATES • Founder');
+            }
+            if (targetRoleNames.has('HQ Admin') || targetRoleNames.has('Admin') || targetRoleNames.has('ELEVATES • Admin') || userRoleKeys.has('hq_admin') || userRoleKeys.has('admin')) {
+              targetRoleNames.add('HQ Admin');
+              targetRoleNames.add('Admin');
+              targetRoleNames.add('ELEVATES • Admin');
+            }
+            if (targetRoleNames.has('Class Rep') || targetRoleNames.has('Class Representative') || userRoleKeys.has('class_rep') || userRoleKeys.has('class_representative')) {
+              targetRoleNames.add('Class Rep');
+              targetRoleNames.add('Class Representative');
+            }
+            if (targetRoleNames.has('Executive Member') || userRoleKeys.has('executive_member') || userRoleKeys.has('executive') || userRoleKeys.has('exec_member')) {
+              targetRoleNames.add('Executive Member');
+            }
+
+            // Explicitly purge any removed roles and their aliases from targetRoleNames and userRoleKeys
+            for (const rk of removedRoleKeys) {
+              userRoleKeys.delete(rk);
+              const mapped = config.mainRoles.getMainRoleForOsRole(rk);
+              if (mapped) targetRoleNames.delete(mapped);
+              if (rk === 'founder') {
+                targetRoleNames.delete('Founder');
+                targetRoleNames.delete('ELEVATES • Founder');
+              }
+              if (rk === 'hq_admin' || rk === 'admin') {
+                targetRoleNames.delete('HQ Admin');
+                targetRoleNames.delete('Admin');
+                targetRoleNames.delete('ELEVATES • Admin');
+              }
+              if (rk === 'campus_lead') {
+                targetRoleNames.delete('Campus Lead');
+              }
+              if (rk === 'executive_member' || rk === 'exec_member' || rk === 'executive') {
+                targetRoleNames.delete('Executive Member');
+              }
+              if (rk === 'class_rep' || rk === 'class_representative') {
+                targetRoleNames.delete('Class Rep');
+                targetRoleNames.delete('Class Representative');
               }
             }
 
@@ -2543,29 +2798,68 @@ module.exports = {
             for (const r of allOsRoles) {
               if (r.name) osManagedRoleNames.add(r.name);
             }
+            osManagedRoleNames.add('Founder');
             osManagedRoleNames.add('ELEVATES • Founder');
+            osManagedRoleNames.add('HQ Admin');
+            osManagedRoleNames.add('Admin');
             osManagedRoleNames.add('ELEVATES • Admin');
+            osManagedRoleNames.add('Executive Member');
+            osManagedRoleNames.add('Class Rep');
+            osManagedRoleNames.add('Class Representative');
 
+            if (member.roles?.cache && typeof member.roles.cache[Symbol.iterator] === 'function') {
+              for (const [, mr] of member.roles.cache) {
+                if (mr && mr.name) {
+                  const mrLower = mr.name.toLowerCase().trim();
+                  if (['founder', 'elevates • founder', 'hq admin', 'admin', 'elevates • admin', 'executive member', 'campus lead', 'class rep', 'class representative'].includes(mrLower)) {
+                    osManagedRoleNames.add(mr.name);
+                  }
+                }
+              }
+            }
+
+            const processedRoleIds = new Set();
             for (const roleName of osManagedRoleNames) {
               let discordRole = guild.roles.cache.find(
                 (r) => !r.managed && r.name.toLowerCase().trim() === roleName.toLowerCase().trim()
               );
-              if (!discordRole && roleName === 'Founder') {
-                discordRole = guild.roles.cache.find((r) => !r.managed && r.name === 'ELEVATES • Founder');
+              if (!discordRole && (roleName === 'Founder' || roleName === 'ELEVATES • Founder')) {
+                discordRole = guild.roles.cache.find((r) => !r.managed && (r.name === 'ELEVATES • Founder' || r.name.toLowerCase() === 'founder'));
               }
-              if (!discordRole && (roleName === 'HQ Admin' || roleName === 'Admin')) {
+              if (!discordRole && (roleName === 'HQ Admin' || roleName === 'Admin' || roleName === 'ELEVATES • Admin')) {
                 discordRole = guild.roles.cache.find(
-                  (r) => !r.managed && (r.name === 'HQ Admin' || r.name === 'ELEVATES • Admin')
+                  (r) => !r.managed && (r.name === 'HQ Admin' || r.name === 'Admin' || r.name === 'ELEVATES • Admin')
                 );
               }
               if (!discordRole) continue;
+              if (processedRoleIds.has(discordRole.id)) continue;
+              processedRoleIds.add(discordRole.id);
+              if (discordRole.editable === false) continue;
+
+              const roleNameLower = roleName.toLowerCase().trim();
+              const discordNameLower = discordRole.name.toLowerCase().trim();
+
+              const isFounderRole = roleNameLower === 'founder' || roleNameLower === 'elevates • founder' || discordNameLower === 'founder' || discordNameLower === 'elevates • founder';
+              const hasFounder = !removedRoleKeys.has('founder') && (targetRoleNames.has('Founder') || targetRoleNames.has('ELEVATES • Founder') || userRoleKeys.has('founder'));
+
+              const isAdminRole = ['hq admin', 'admin', 'elevates • admin'].includes(roleNameLower) || ['hq admin', 'admin', 'elevates • admin'].includes(discordNameLower);
+              const hasAdmin = !removedRoleKeys.has('admin') && !removedRoleKeys.has('hq_admin') && (targetRoleNames.has('HQ Admin') || targetRoleNames.has('Admin') || targetRoleNames.has('ELEVATES • Admin') || userRoleKeys.has('hq_admin') || userRoleKeys.has('admin'));
+
+              const isClassRepRole = ['class rep', 'class representative'].includes(roleNameLower) || ['class rep', 'class representative'].includes(discordNameLower);
+              const hasClassRep = !removedRoleKeys.has('class_rep') && !removedRoleKeys.has('class_representative') && (targetRoleNames.has('Class Rep') || targetRoleNames.has('Class Representative') || userRoleKeys.has('class_rep') || userRoleKeys.has('class_representative'));
+
+              const isExecRole = ['executive member', 'executive team', 'executive'].includes(roleNameLower) || ['executive member', 'executive team', 'executive'].includes(discordNameLower);
+              const hasExec = !removedRoleKeys.has('executive_member') && !removedRoleKeys.has('executive') && !removedRoleKeys.has('exec_member') && (targetRoleNames.has('Executive Member') || userRoleKeys.has('executive_member') || userRoleKeys.has('executive'));
 
               const shouldHave =
-                targetRoleNames.has(roleName) ||
+                !removedRoleKeys.has(roleNameLower) &&
+                !removedRoleKeys.has(discordNameLower) &&
+                (targetRoleNames.has(roleName) ||
                 targetRoleNames.has(discordRole.name) ||
-                (roleName === 'Founder' && (targetRoleNames.has('Founder') || targetRoleNames.has('ELEVATES • Founder'))) ||
-                ((roleName === 'HQ Admin' || roleName === 'Admin') && (targetRoleNames.has('HQ Admin') || targetRoleNames.has('Admin') || targetRoleNames.has('ELEVATES • Admin'))) ||
-                ((roleName === 'Class Rep' || roleName === 'Class Representative') && (targetRoleNames.has('Class Rep') || targetRoleNames.has('Class Representative')));
+                (isFounderRole && hasFounder) ||
+                (isAdminRole && hasAdmin) ||
+                (isClassRepRole && hasClassRep) ||
+                (isExecRole && hasExec));
 
               const currentlyHas = member.roles.cache.has(discordRole.id);
 
@@ -2588,7 +2882,7 @@ module.exports = {
                       },
                       'role_changes'
                     ).catch(() => {});
-                    this.updateChapterCurrentRolesTopic(client, targetChapter).catch(() => {});
+                    targetChaptersToUpdate.add(targetChapter);
                   }
                 } catch (err) {
                   console.warn(`[syncUserAcrossGuilds] Could not add main role "${discordRole.name}" to ${member.user.tag}:`, err.message);
@@ -2612,7 +2906,7 @@ module.exports = {
                       },
                       'role_changes'
                     ).catch(() => {});
-                    this.updateChapterCurrentRolesTopic(client, targetChapter).catch(() => {});
+                    targetChaptersToUpdate.add(targetChapter);
                   }
                 } catch (err) {
                   console.warn(`[syncUserAcrossGuilds] Could not remove main role "${discordRole.name}" from ${member.user.tag}:`, err.message);
@@ -2620,38 +2914,86 @@ module.exports = {
               }
             }
 
-            if (profile.full_name && member.displayName !== profile.full_name) {
+            if (profile.full_name && member.displayName !== profile.full_name && member.manageable !== false && member.id !== guild.ownerId) {
               await member.setNickname(profile.full_name).catch(() => {});
             }
           } else {
             // Member is NOT linked / disconnected in the Main Server
-            if (unverifiedRole && !member.roles.cache.has(unverifiedRole.id)) {
-              await member.roles.add(unverifiedRole).catch(() => {});
+            // 1. Explicitly remove all verified role variants if member holds them
+            for (const [, vRole] of verifiedRoles) {
+              if (member.roles.cache.has(vRole.id) && member.id !== guild.ownerId && member.manageable !== false && vRole.editable !== false) {
+                await member.roles.remove(vRole).catch((err) => {
+                  console.warn(`[syncUserAcrossGuilds] Could not remove verified role "${vRole.name}" from ${member.user.tag}:`, err.message);
+                });
+                console.log(`[syncUserAcrossGuilds] Removed verified role "${vRole.name}" from unlinked ${member.user.tag}`);
+              }
             }
 
-            // Remove any assigned fixed membership/leadership roles
+            // 2. Add unverified role
+            if (unverifiedRole && !member.roles.cache.has(unverifiedRole.id)) {
+              if (member.id !== guild.ownerId && member.manageable !== false && unverifiedRole.editable !== false) {
+                await member.roles.add(unverifiedRole).catch(() => {});
+                console.log(`[syncUserAcrossGuilds] Assigned unverified role "${unverifiedRole.name}" to unlinked ${member.user.tag}`);
+              }
+            }
+
+            // 3. Remove any assigned fixed membership/leadership roles
             const allOsRoles = await this.getAllOsRoles();
             const osManagedRoleNames = new Set(allowedFixedRoles);
             for (const r of allOsRoles) {
               if (r.name) osManagedRoleNames.add(r.name);
             }
+            osManagedRoleNames.add('Founder');
             osManagedRoleNames.add('ELEVATES • Founder');
+            osManagedRoleNames.add('HQ Admin');
+            osManagedRoleNames.add('Admin');
             osManagedRoleNames.add('ELEVATES • Admin');
+            osManagedRoleNames.add('Executive Member');
+            osManagedRoleNames.add('Class Rep');
+            osManagedRoleNames.add('Class Representative');
+            osManagedRoleNames.add('Verified Member');
+            osManagedRoleNames.add('ELEVATES • Member');
 
+            if (member.roles?.cache && typeof member.roles.cache[Symbol.iterator] === 'function') {
+              for (const [, mr] of member.roles.cache) {
+                if (mr && mr.name) {
+                  const mrLower = mr.name.toLowerCase().trim();
+                  if (['founder', 'elevates • founder', 'hq admin', 'admin', 'elevates • admin', 'executive member', 'campus lead', 'class rep', 'class representative', 'verified member', 'elevates • member'].includes(mrLower)) {
+                    osManagedRoleNames.add(mr.name);
+                  }
+                }
+              }
+            }
+
+            const processedUnlinkedRoleIds = new Set();
             for (const roleName of osManagedRoleNames) {
               if (roleName === 'Unverified') continue;
               let discordRole = guild.roles.cache.find(
                 (r) => !r.managed && r.name.toLowerCase().trim() === roleName.toLowerCase().trim()
               );
-              if (!discordRole && roleName === 'Founder') {
-                discordRole = guild.roles.cache.find((r) => !r.managed && r.name === 'ELEVATES • Founder');
+              if (!discordRole && (roleName === 'Founder' || roleName === 'ELEVATES • Founder')) {
+                discordRole = guild.roles.cache.find((r) => !r.managed && (r.name === 'ELEVATES • Founder' || r.name.toLowerCase() === 'founder'));
               }
-              if (!discordRole && (roleName === 'HQ Admin' || roleName === 'Admin')) {
+              if (!discordRole && (roleName === 'HQ Admin' || roleName === 'Admin' || roleName === 'ELEVATES • Admin')) {
                 discordRole = guild.roles.cache.find(
-                  (r) => !r.managed && (r.name === 'HQ Admin' || r.name === 'ELEVATES • Admin')
+                  (r) => !r.managed && (r.name === 'HQ Admin' || r.name === 'Admin' || r.name === 'ELEVATES • Admin')
                 );
               }
-              if (discordRole && member.roles.cache.has(discordRole.id)) {
+              if (!discordRole && (roleName === 'Verified Member' || roleName === 'ELEVATES • Member')) {
+                discordRole = guild.roles.cache.find(
+                  (r) => !r.managed && (
+                    r.name.toLowerCase() === 'verified member' ||
+                    r.name.toLowerCase() === 'elevates • member' ||
+                    r.name.toLowerCase() === (config.roles.verified || '').toLowerCase()
+                  )
+                );
+              }
+              if (!discordRole) continue;
+              if (processedUnlinkedRoleIds.has(discordRole.id)) continue;
+              processedUnlinkedRoleIds.add(discordRole.id);
+              if (discordRole.editable === false) continue;
+
+              if (member.roles.cache.has(discordRole.id)) {
                 await member.roles.remove(discordRole).catch(() => {});
                 console.log(`[syncUserAcrossGuilds] Removed main role "${discordRole.name}" from unlinked ${member.user.tag}`);
               }
@@ -2660,9 +3002,48 @@ module.exports = {
           continue;
         }
 
-        // CASE 2: Chapter Server matching member's current OS chapter
-        if (guildType === 'chapter' && guildChapterId === userChapterId) {
-          if (isConnected && profile) {
+        // Chapter Servers
+        if (guildType === 'chapter') {
+          if (!isConnected || !profile) {
+            // Unlinked / disconnected member in chapter server
+            // 1. Remove all verified role variants
+            for (const [, vRole] of verifiedRoles) {
+              if (member.roles.cache.has(vRole.id) && member.id !== guild.ownerId && member.manageable !== false && vRole.editable !== false) {
+                await member.roles.remove(vRole).catch(() => {});
+                console.log(`[syncUserAcrossGuilds] Removed verified role "${vRole.name}" from unlinked ${member.user.tag} in ${guild.name}`);
+              }
+            }
+
+            // 2. Add unverified role
+            if (unverifiedRole && !member.roles.cache.has(unverifiedRole.id)) {
+              if (member.id !== guild.ownerId && member.manageable !== false && unverifiedRole.editable !== false) {
+                await member.roles.add(unverifiedRole).catch(() => {});
+                console.log(`[syncUserAcrossGuilds] Assigned unverified role "${unverifiedRole.name}" to unlinked ${member.user.tag} in ${guild.name}`);
+              }
+            }
+
+            // 3. Remove all chapter and OS roles
+            const allRoles = await this.getAllOsRoles();
+            const standardRoles = ['Campus Lead', 'Class Representative', 'Class Rep', 'Executive Member', 'Student', 'Guest', 'Founder', 'Admin'];
+            const rolesToRemove = new Set(standardRoles);
+            for (const r of allRoles) {
+              if (r.name) rolesToRemove.add(r.name);
+              if (r.key) rolesToRemove.add(r.key);
+            }
+
+            for (const rName of rolesToRemove) {
+              const gRole = guild.roles.cache.find(
+                (r) => !r.managed && r.name.toLowerCase().trim() === rName.toLowerCase().trim()
+              );
+              if (gRole && member.roles.cache.has(gRole.id) && gRole.editable !== false) {
+                await member.roles.remove(gRole).catch(() => {});
+              }
+            }
+            continue;
+          }
+
+          // CASE 2: Connected member in matching chapter
+          if (guildChapterId === userChapterId) {
             // 1. Ensure verified role and remove unverified/guest
             if (verifiedRole && !member.roles.cache.has(verifiedRole.id)) {
               await member.roles.add(verifiedRole).catch(() => {});
@@ -2680,88 +3061,149 @@ module.exports = {
             }
 
             // 2. Set Nickname to OS Full Name
-            if (profile.full_name) {
+            if (profile.full_name && member.displayName !== profile.full_name && member.manageable !== false && member.id !== guild.ownerId) {
               await member.setNickname(profile.full_name).catch(() => {});
             }
 
             // 3. Reconcile Chapter Roles: Campus Lead, Class Rep, Student, etc.
             const userChapterRoleKeys = new Set(
               userRoles
-                .filter((r) => r.chapter_id === guildChapterId || !r.chapter_id)
+                .filter((r) => (r.chapter_id === guildChapterId || !r.chapter_id) && !removedRoleKeys.has((r.role_key || r.role || '').toLowerCase().trim()))
                 .map((r) => (r.role_key || r.role || '').toLowerCase().trim())
             );
 
             // Include profile designation and role ONLY if user has no assigned records in user_roles
             if (userRoles.length === 0 && (userChapterId === guildChapterId || !userChapterId)) {
-              if (profile.designation) userChapterRoleKeys.add(profile.designation.toLowerCase().trim());
-              if (profile.role) userChapterRoleKeys.add(profile.role.toLowerCase().trim());
+              if (profile.designation) {
+                const des = profile.designation.toLowerCase().trim();
+                if (!removedRoleKeys.has(des)) userChapterRoleKeys.add(des);
+              }
+              if (profile.role) {
+                const rol = profile.role.toLowerCase().trim();
+                if (!removedRoleKeys.has(rol)) userChapterRoleKeys.add(rol);
+              }
             }
 
-            // Also check if user is the assigned campus_lead for this chapter in chapters table
-            try {
-              const { data: chRow } = await supabase
-                .from('chapters')
-                .select('campus_lead_id')
-                .eq('id', guildChapterId)
-                .maybeSingle();
-              if (chRow && chRow.campus_lead_id === profile.id) {
-                userChapterRoleKeys.add('campus_lead');
+            // Also check if user is the assigned campus_lead for this chapter in chapters table (unless explicitly removed)
+            if (!removedRoleKeys.has('campus_lead')) {
+              try {
+                const { data: chRow } = await supabase
+                  .from('chapters')
+                  .select('campus_lead_id')
+                  .eq('id', guildChapterId)
+                  .maybeSingle();
+                if (chRow && chRow.campus_lead_id === profile.id) {
+                  userChapterRoleKeys.add('campus_lead');
+                }
+              } catch (_) {}
+            }
+
+            for (const rk of removedRoleKeys) {
+              userChapterRoleKeys.delete(rk);
+              if (rk === 'class_representative' || rk === 'class_rep') {
+                userChapterRoleKeys.delete('class_representative');
+                userChapterRoleKeys.delete('class_rep');
               }
-            } catch (_) {}
+              if (rk === 'executive_member' || rk === 'exec_member' || rk === 'executive') {
+                userChapterRoleKeys.delete('executive_member');
+                userChapterRoleKeys.delete('exec_member');
+                userChapterRoleKeys.delete('executive');
+              }
+            }
 
             // Fetch all OS role definitions to map them to Discord roles
             const allRoles = await this.getAllOsRoles();
-            for (const rDef of allRoles) {
+            const standardRoleDefs = [
+              { key: 'campus_lead', name: 'Campus Lead' },
+              { key: 'class_representative', name: 'Class Representative' },
+              { key: 'class_rep', name: 'Class Rep' },
+              { key: 'executive_member', name: 'Executive Member' },
+              { key: 'student', name: 'Student' },
+              { key: 'guest', name: 'Guest' },
+            ];
+            const combinedRoles = [...allRoles];
+            for (const s of standardRoleDefs) {
+              if (!combinedRoles.some((r) => (r.key || '').toLowerCase() === s.key)) {
+                combinedRoles.push(s);
+              }
+            }
+
+            for (const rDef of combinedRoles) {
               const rName = rDef.name || rDef.key;
-              const gRole = guild.roles.cache.find(
+              let gRole = guild.roles.cache.find(
                 (r) => !r.managed && (
                   r.name.toLowerCase().trim() === rName.toLowerCase().trim() ||
                   (rDef.key === 'class_representative' && r.name.toLowerCase().trim() === 'class rep') ||
                   (rDef.key === 'executive_member' && (r.name.toLowerCase().trim() === 'executive member' || r.name.toLowerCase().trim() === 'executive team' || r.name.toLowerCase().trim() === 'executive'))
                 )
               );
-              if (!gRole) continue;
+
+              const roleDefKey = (rDef.key || '').toLowerCase().trim();
+              const isExplicitlyRemoved = removedRoleKeys.has(roleDefKey) ||
+                (roleDefKey === 'class_representative' && (removedRoleKeys.has('class_rep') || removedRoleKeys.has('class_representative'))) ||
+                (roleDefKey === 'executive_member' && (removedRoleKeys.has('executive_member') || removedRoleKeys.has('exec_member') || removedRoleKeys.has('executive')));
 
               const shouldHave =
-                userChapterRoleKeys.has(rDef.key.toLowerCase()) ||
-                (rDef.key === 'campus_lead' && userChapterRoleKeys.has('campus_lead')) ||
-                (rDef.key === 'class_representative' && (userChapterRoleKeys.has('class_representative') || userChapterRoleKeys.has('class_rep'))) ||
-                (rDef.key === 'executive_member' && (userChapterRoleKeys.has('executive_member') || userChapterRoleKeys.has('exec_member') || userChapterRoleKeys.has('executive')));
+                !isExplicitlyRemoved &&
+                (userChapterRoleKeys.has(roleDefKey) ||
+                (roleDefKey === 'campus_lead' && userChapterRoleKeys.has('campus_lead')) ||
+                (roleDefKey === 'class_representative' && (userChapterRoleKeys.has('class_representative') || userChapterRoleKeys.has('class_rep'))) ||
+                (roleDefKey === 'executive_member' && (userChapterRoleKeys.has('executive_member') || userChapterRoleKeys.has('exec_member') || userChapterRoleKeys.has('executive'))));
+
+              // If the role does not exist in the guild, but user should have it, auto-create it in this chapter server
+              if (!gRole && shouldHave && guild.roles?.create) {
+                try {
+                  gRole = await guild.roles.create({
+                    name: roleDefKey === 'executive_member' ? (config.roles.executiveMember || 'Executive Member') : rName,
+                    color: roleDefKey === 'executive_member' ? 0x3B82F6 : (roleDefKey === 'campus_lead' ? 0xF59E0B : undefined),
+                    reason: `ElevatesOS Auto-Role Setup for ${rName}`,
+                  });
+                } catch (createErr) {
+                  console.warn(`[syncUserAcrossGuilds] Could not auto-create role "${rName}" in ${guild.name}:`, createErr.message);
+                }
+              }
+
+              if (!gRole) continue;
+              if (gRole.editable === false) continue;
 
               if (shouldHave && !member.roles.cache.has(gRole.id)) {
                 await member.roles.add(gRole).catch(() => {});
                 console.log(`[syncUserAcrossGuilds] Added chapter role "${gRole.name}" to ${member.user.tag}`);
-                this.logChapterEvent(
-                  client,
-                  guildChapterId,
-                  guild.id,
-                  'role_assigned',
-                  {
-                    user: `<@${member.id}> (${profile.full_name || member.user.username})`,
-                    role: gRole.name,
-                    server: guild.name,
-                    discord_user_id: member.id,
-                  },
-                  'role_changes'
-                ).catch(() => {});
-                this.updateChapterCurrentRolesTopic(client, guildChapterId).catch(() => {});
+                if (guildChapterId) {
+                  this.logChapterEvent(
+                    client,
+                    guildChapterId,
+                    guild.id,
+                    'role_assigned',
+                    {
+                      user: `<@${member.id}> (${profile.full_name || member.user.username})`,
+                      role: gRole.name,
+                      server: guild.name,
+                      discord_user_id: member.id,
+                    },
+                    'role_changes'
+                  ).catch(() => {});
+                  targetChaptersToUpdate.add(guildChapterId);
+                }
               } else if (!shouldHave && member.roles.cache.has(gRole.id)) {
                 await member.roles.remove(gRole).catch(() => {});
                 console.log(`[syncUserAcrossGuilds] Removed chapter role "${gRole.name}" from ${member.user.tag}`);
-                this.logChapterEvent(
-                  client,
-                  guildChapterId,
-                  guild.id,
-                  'role_revoked',
-                  {
-                    user: `<@${member.id}> (${profile.full_name || member.user.username})`,
-                    role: gRole.name,
-                    server: guild.name,
-                    discord_user_id: member.id,
-                  },
-                  'role_changes'
-                ).catch(() => {});
-                this.updateChapterCurrentRolesTopic(client, guildChapterId).catch(() => {});
+                if (guildChapterId) {
+                  this.logChapterEvent(
+                    client,
+                    guildChapterId,
+                    guild.id,
+                    'role_revoked',
+                    {
+                      user: `<@${member.id}> (${profile.full_name || member.user.username})`,
+                      role: gRole.name,
+                      server: guild.name,
+                      discord_user_id: member.id,
+                    },
+                    'role_changes'
+                  ).catch(() => {});
+                  targetChaptersToUpdate.add(guildChapterId);
+                }
               }
             }
 
@@ -2769,45 +3211,33 @@ module.exports = {
             const { postVerificationWelcomeCard } = require('./generateWelcomeCard');
             await postVerificationWelcomeCard(guild, member, profile.full_name);
           } else {
-            // Unlinked member in chapter server
-            if (verifiedRole && member.roles.cache.has(verifiedRole.id)) {
-              await member.roles.remove(verifiedRole).catch(() => {});
-            }
-            if (unverifiedRole && !member.roles.cache.has(unverifiedRole.id)) {
-              await member.roles.add(unverifiedRole).catch(() => {});
-            }
+            // CASE 3: Chapter Server for a DIFFERENT chapter (Assignment changed)
+            // Remove chapter-specific roles from this old chapter server
             const allRoles = await this.getAllOsRoles();
             for (const rDef of allRoles) {
+              const rName = rDef.name || rDef.key;
               const gRole = guild.roles.cache.find(
-                (r) => !r.managed && r.name.toLowerCase().trim() === (rDef.name || rDef.key).toLowerCase().trim()
+                (r) => !r.managed && r.name.toLowerCase().trim() === rName.toLowerCase().trim()
               );
               if (gRole && member.roles.cache.has(gRole.id)) {
                 await member.roles.remove(gRole).catch(() => {});
               }
             }
+
+            // Remove all verified role variants from old chapter server
+            for (const [, vRole] of verifiedRoles) {
+              if (member.roles.cache.has(vRole.id) && vRole.editable !== false) {
+                await member.roles.remove(vRole).catch(() => {});
+              }
+            }
           }
           continue;
         }
+      }
 
-        // CASE 3: Chapter Server for a DIFFERENT chapter (Assignment changed)
-        if (guildType === 'chapter' && guildChapterId !== userChapterId) {
-          // Remove chapter-specific roles from this old chapter server
-          const allRoles = await this.getAllOsRoles();
-          for (const rDef of allRoles) {
-            const rName = rDef.name || rDef.key;
-            const gRole = guild.roles.cache.find(
-              (r) => !r.managed && r.name.toLowerCase().trim() === rName.toLowerCase().trim()
-            );
-            if (gRole && member.roles.cache.has(gRole.id)) {
-              await member.roles.remove(gRole).catch(() => {});
-            }
-          }
-
-          // Remove verified role from old chapter server
-          if (verifiedRole && member.roles.cache.has(verifiedRole.id)) {
-            await member.roles.remove(verifiedRole).catch(() => {});
-          }
-        }
+      // Update chapter live rosters once after role additions/removals settle
+      for (const chId of targetChaptersToUpdate) {
+        this.updateChapterCurrentRolesTopic(client, chId).catch(() => {});
       }
     });
   },
@@ -2815,7 +3245,7 @@ module.exports = {
   /**
    * Unlinks an ElevatesOS identity completely.
    */
-  async unlinkIdentity(discordUserId, guildId = null, reason = 'manual_unlink') {
+  async unlinkIdentity(discordUserId, guildId = null, reason = 'manual_unlink', client = null) {
     try {
       const now = new Date().toISOString();
 
@@ -2851,6 +3281,13 @@ module.exports = {
               detail: { reason },
             });
         } catch (_) {}
+      }
+
+      // 4. Sync across guilds if client provided
+      if (client) {
+        await this.syncUserAcrossGuilds(client, discordUserId).catch((err) => {
+          console.warn(`[unlinkIdentity] syncUserAcrossGuilds failed:`, err.message);
+        });
       }
 
       return { ok: true };

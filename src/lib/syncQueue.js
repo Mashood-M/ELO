@@ -6,11 +6,13 @@
 class SyncQueue {
   constructor() {
     this.queue = [];
+    this.activeWorkers = 0;
+    this.maxConcurrency = 3;
     this.processing = false;
     this.pendingSet = new Set(); // deduplication for pending tasks
     this.inFlightSet = new Set(); // deduplication for in-flight tasks
     this.rateLimitedUntil = 0;
-    this.minDelayMs = 250; // space calls by 250ms (well under Discord 50 req/s global limit)
+    this.minDelayMs = 25; // fast spacing between calls (reduced from 250ms)
     this.maxRetries = 4;
   }
 
@@ -22,8 +24,16 @@ class SyncQueue {
    * @param {number} [attempt=1]
    * @param {Function} [resolve=null]
    * @param {Function} [reject=null]
+   * @param {string} [priority='normal'] - 'high' | 'normal' | 'low'
+   * @returns {Promise<any>|void}
    */
-  enqueue(type, id, taskFn, attempt = 1, resolve = null, reject = null) {
+  enqueue(type, id, taskFn, attempt = 1, resolve = null, reject = null, priority = 'normal') {
+    if (!resolve) {
+      return new Promise((res, rej) => {
+        this.enqueue(type, id, taskFn, attempt, res, rej, priority);
+      });
+    }
+
     const key = `${type}:${id}`;
     if (this.pendingSet.has(key)) {
       if (resolve) resolve(null);
@@ -31,11 +41,29 @@ class SyncQueue {
     }
 
     this.pendingSet.add(key);
-    this.queue.push({ type, id, key, taskFn, attempt, resolve, reject });
+    const item = { type, id, key, taskFn, attempt, resolve, reject, priority };
 
-    if (!this.processing) {
-      this.processQueue();
+    if (priority === 'high') {
+      // High priority: insert ahead of normal or low priority items
+      const insertIdx = this.queue.findIndex((q) => q.priority !== 'high');
+      if (insertIdx === -1) {
+        this.queue.push(item);
+      } else {
+        this.queue.splice(insertIdx, 0, item);
+      }
+    } else if (priority === 'low') {
+      this.queue.push(item);
+    } else {
+      // Normal priority: insert ahead of low priority items
+      const insertIdx = this.queue.findIndex((q) => q.priority === 'low');
+      if (insertIdx === -1) {
+        this.queue.push(item);
+      } else {
+        this.queue.splice(insertIdx, 0, item);
+      }
     }
+
+    this.triggerWorkers();
   }
 
   /**
@@ -45,20 +73,31 @@ class SyncQueue {
    * @param {string} type
    * @param {string} id
    * @param {Function} taskFn
+   * @param {string} [priority='high']
    * @returns {Promise<any>}
    */
-  enqueueAsync(type, id, taskFn) {
+  enqueueAsync(type, id, taskFn, priority = 'high') {
     return new Promise((resolve, reject) => {
       const opKey = `${id}:${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
-      this.enqueue(type, opKey, taskFn, 1, resolve, reject);
+      this.enqueue(type, opKey, taskFn, 1, resolve, reject, priority);
     });
   }
 
   /**
-   * Process items in the queue sequentially.
+   * Trigger worker pool up to maxConcurrency.
    */
-  async processQueue() {
-    if (this.processing) return;
+  triggerWorkers() {
+    while (this.activeWorkers < this.maxConcurrency && this.queue.length > 0) {
+      this.startWorker();
+    }
+    this.processing = this.activeWorkers > 0;
+  }
+
+  /**
+   * Worker loop that drains the queue.
+   */
+  async startWorker() {
+    this.activeWorkers++;
     this.processing = true;
 
     while (this.queue.length > 0) {
@@ -69,7 +108,10 @@ class SyncQueue {
         await new Promise((res) => setTimeout(res, waitMs));
       }
 
+      if (this.queue.length === 0) break;
       const item = this.queue.shift();
+      if (!item) break;
+
       this.pendingSet.delete(item.key);
       this.inFlightSet.add(item.key);
 
@@ -78,11 +120,11 @@ class SyncQueue {
         if (item.resolve) item.resolve(result);
       } catch (err) {
         const isRateLimit =
-          err.status === 429 ||
-          err.code === 429 ||
-          err.name === 'RateLimitError' ||
-          Boolean(err.retryAfter) ||
-          Boolean(err.rawError?.retry_after);
+          err?.status === 429 ||
+          err?.code === 429 ||
+          err?.name === 'RateLimitError' ||
+          Boolean(err?.retryAfter) ||
+          Boolean(err?.rawError?.retry_after);
 
         if (isRateLimit) {
           const retryAfterMs = Math.ceil(
@@ -95,13 +137,13 @@ class SyncQueue {
           this.pendingSet.add(item.key);
           this.queue.unshift(item);
         } else {
-          console.error(`[SyncQueue] Error processing job ${item.key}:`, err.message || err);
+          console.error(`[SyncQueue] Error processing job ${item.key}:`, err?.message || err);
 
           if (item.attempt < this.maxRetries) {
             const backoffMs = Math.pow(2, item.attempt) * 500;
             console.log(`[SyncQueue] Scheduling retry ${item.attempt + 1}/${this.maxRetries} for ${item.key} after ${backoffMs}ms`);
             setTimeout(() => {
-              this.enqueue(item.type, item.id, item.taskFn, item.attempt + 1, item.resolve, item.reject);
+              this.enqueue(item.type, item.id, item.taskFn, item.attempt + 1, item.resolve, item.reject, item.priority);
             }, backoffMs);
           } else {
             console.error(`[SyncQueue] Job ${item.key} exceeded max retries (${this.maxRetries}). Dropping.`);
@@ -112,11 +154,21 @@ class SyncQueue {
         this.inFlightSet.delete(item.key);
       }
 
-      // Minimum delay between Discord API calls to prevent bursts
-      await new Promise((res) => setTimeout(res, this.minDelayMs));
+      // Fast spacing between calls
+      if (this.minDelayMs > 0) {
+        await new Promise((res) => setTimeout(res, this.minDelayMs));
+      }
     }
 
-    this.processing = false;
+    this.activeWorkers--;
+    this.processing = this.activeWorkers > 0;
+  }
+
+  /**
+   * Process items in the queue (compatibility wrapper).
+   */
+  processQueue() {
+    this.triggerWorkers();
   }
 
   /**
@@ -125,7 +177,8 @@ class SyncQueue {
   getStats() {
     return {
       size: this.queue.length,
-      processing: this.processing,
+      activeWorkers: this.activeWorkers,
+      processing: this.activeWorkers > 0,
       rateLimited: this.rateLimitedUntil > Date.now(),
       rateLimitedForMs: Math.max(0, this.rateLimitedUntil - Date.now()),
     };

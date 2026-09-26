@@ -22,21 +22,37 @@ module.exports = {
     }
 
     try {
-      await api.unlinkIdentity(target.id, interaction.guild.id, `unlinked_by_${interaction.user.tag}`);
+      await api.unlinkIdentity(target.id, interaction.guild.id, `unlinked_by_${interaction.user.tag}`, interaction.client);
     } catch (err) {
       await interaction.editReply({ content: `Failed to unlink: ${err.message}` });
       return;
     }
 
-    const verifiedRole = interaction.guild.roles.cache.find(
-      (r) => r.name.toLowerCase() === (config.roles.verified || 'ELEVATES • Member').toLowerCase()
+    const verifiedRoles = interaction.guild.roles.cache.filter(
+      (r) => !r.managed && (
+        r.name.toLowerCase() === 'verified member' ||
+        r.name.toLowerCase() === 'elevates • member' ||
+        r.name.toLowerCase() === (config.roles.verified || '').toLowerCase()
+      )
     );
     const unverifiedRole = interaction.guild.roles.cache.find(
-      (r) => r.name.toLowerCase() === (config.roles.unverified || 'elevates').toLowerCase()
+      (r) => !r.managed && (
+        r.name.toLowerCase() === 'unverified' ||
+        r.name.toLowerCase() === (config.roles.unverified || 'elevates').toLowerCase()
+      )
     );
 
-    if (verifiedRole) await target.roles.remove(verifiedRole).catch(() => {});
-    if (unverifiedRole) await target.roles.add(unverifiedRole).catch(() => {});
+    for (const [, vRole] of verifiedRoles) {
+      if (target.roles.cache.has(vRole.id)) {
+        await target.roles.remove(vRole).catch(() => {});
+      }
+    }
+    if (unverifiedRole && !target.roles.cache.has(unverifiedRole.id)) {
+      await target.roles.add(unverifiedRole).catch(() => {});
+    }
+
+    // Trigger complete de-provisioning across all guilds
+    await api.syncUserAcrossGuilds(interaction.client, target.id).catch(() => {});
 
     await interaction.editReply(`🔗 **${target.user.tag}** has been unlinked from ElevatesOS. They will need to re-link to regain chapter access.`);
 

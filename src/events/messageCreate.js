@@ -55,15 +55,15 @@ module.exports = {
       if (!config.features?.unverifiedNudge) return;
 
       try {
-        const guildConfig = await api.getGuildConfig(message.guild.id).catch(() => null);
-        if (guildConfig?.guildType !== 'chapter') return;
-
         const unverifiedRoleName = (config.roles.unverified || 'elevates').toLowerCase();
         const hasUnverifiedRole = message.member?.roles?.cache?.some(
           (r) => r.name.toLowerCase() === unverifiedRoleName
         );
 
         if (!hasUnverifiedRole) return;
+
+        const guildConfig = await api.getGuildConfig(message.guild.id).catch(() => null);
+        if (guildConfig?.guildType !== 'chapter') return;
 
         // Rate limit: 1 nudge every 10 minutes per user
         const now = Date.now();

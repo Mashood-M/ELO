@@ -45,6 +45,20 @@ module.exports = {
     ],
   },
 
+  // Mapping between commands and their required delegated permission in term_members.permissions
+  delegatedPermissions: {
+    ban: 'ban',
+    unban: 'unban',
+    unlink: 'unlink',
+    kick: 'kick',
+    mute: 'mute',
+    warn: 'warn',
+    warnings: 'warn',
+    announce: 'announce',
+    'reply-as-bot': 'reply-as-bot',
+    clear: 'clear',
+  },
+
   features: {
     welcomeCard: process.env.FEATURE_WELCOME_CARD !== 'false',
     unverifiedNudge: process.env.FEATURE_UNVERIFIED_NUDGE !== 'false',
@@ -64,6 +78,7 @@ module.exports = {
       'HQ Admin',
       'Community Manager',
       'Campus Lead',
+      'Executive Member',
       'Class Rep',
       'Verified Member',
       'Guest',
@@ -77,9 +92,9 @@ module.exports = {
       admin: 'HQ Admin',
       community_manager: 'Community Manager',
       campus_lead: 'Campus Lead',
-      executive_member: 'Verified Member',
-      exec_member: 'Verified Member',
-      executive: 'Verified Member',
+      executive_member: 'Executive Member',
+      exec_member: 'Executive Member',
+      executive: 'Executive Member',
       class_representative: 'Class Rep',
       class_rep: 'Class Rep',
       guest: 'Guest',

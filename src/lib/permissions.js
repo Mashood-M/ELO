@@ -220,8 +220,65 @@ async function canUserExecuteCommand(discordUserId, guildId, commandName, member
     }
 
     // Check permissions in chapter server
+    // 1. Campus Lead check: Campus Lead retains full access across all campus_lead commands regardless of delegated permissions
+    const isCampusLead = chapterRoleKeys.has('campus_lead');
+    if (isCampusLead) {
+      const allowedLeadCommands = COMMAND_PERMISSIONS.chapter.campus_lead || [];
+      if (allowedLeadCommands.includes('*') || allowedLeadCommands.includes(commandName)) {
+        return { allowed: true, identity, guildConfig };
+      }
+    }
+
+    // 2. Executive Member per-person delegated permissions check (live lookup from term_members)
+    const isExecutiveMember =
+      chapterRoleKeys.has('executive_member') ||
+      chapterRoleKeys.has('exec_member') ||
+      chapterRoleKeys.has('executive');
+
+    const delegatedPermMapping = config.delegatedPermissions || {
+      ban: 'ban',
+      unban: 'unban',
+      unlink: 'unlink',
+      kick: 'kick',
+      mute: 'mute',
+      warn: 'warn',
+      warnings: 'warn',
+      announce: 'announce',
+      'reply-as-bot': 'reply-as-bot',
+      clear: 'clear',
+    };
+
+    const requiredDelegatedPerm = delegatedPermMapping[commandName];
+
+    if (isExecutiveMember && requiredDelegatedPerm) {
+      // Query term_members row for chapter's active term
+      const delegatedPerms = await api.getUserDelegatedPermissions(guildChapterId, profile.id);
+      if (delegatedPerms.includes('*') || delegatedPerms.includes(requiredDelegatedPerm)) {
+        return { allowed: true, identity, guildConfig };
+      } else {
+        return {
+          allowed: false,
+          reason: `You do not have the delegated '${requiredDelegatedPerm}' permission for this chapter's active term.`,
+          identity,
+          guildConfig,
+        };
+      }
+    }
+
+    // 3. Check static permission matrix for any non-delegated commands or other roles
     const allowedChapterCommands = new Set();
     for (const r of chapterRoleKeys) {
+      // Executive members must NOT inherit delegated moderation commands from the static matrix
+      // since their moderation powers are evaluated live per-person above!
+      if (['executive_member', 'exec_member', 'executive'].includes(r)) {
+        const perms = COMMAND_PERMISSIONS.chapter[r] || [];
+        for (const p of perms) {
+          if (!delegatedPermMapping[p]) {
+            allowedChapterCommands.add(p);
+          }
+        }
+        continue;
+      }
       const perms = COMMAND_PERMISSIONS.chapter[r] || [];
       for (const p of perms) allowedChapterCommands.add(p);
     }
@@ -289,6 +346,7 @@ async function checkCommandPermission(interaction, commandName) {
 
 module.exports = {
   COMMAND_PERMISSIONS,
+  DELEGATED_PERMISSIONS: config.delegatedPermissions,
   canUserExecuteCommand,
   checkCommandPermission,
 };
