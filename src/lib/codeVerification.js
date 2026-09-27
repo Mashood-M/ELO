@@ -163,6 +163,76 @@ async function handleLinkServerMessage(message) {
 
     const osUserId = codeRow.user_id || codeRow.os_user_id;
 
+    // --- ENFORCE STRICT 1:1 ACCOUNT CONNECTION ---
+    // Check 1: Is this Discord account already connected to a different ElevatesOS profile?
+    const { data: existingProfilesForDiscord } = await supabase
+      .from('profiles')
+      .select('id, full_name, elevates_id, discord_user_id, discord_connected')
+      .eq('discord_user_id', discordUserId)
+      .eq('discord_connected', true);
+
+    const otherProfile = existingProfilesForDiscord?.find((p) => p.id !== osUserId);
+    if (otherProfile) {
+      console.warn(`[codeVerification] Rejected 1:N link attempt: Discord account ${discordUserId} is already connected to OS user ${otherProfile.id} (${otherProfile.full_name || 'Member'})`);
+      const errorMsg = await message.channel.send(
+        `❌ ${message.author} This Discord account is already connected to another ElevatesOS account. Each Discord account can only be linked to one ElevatesOS account. Please unlink your other account first.`
+      ).catch(() => null);
+      if (errorMsg) setTimeout(() => errorMsg.delete().catch(() => {}), 8000);
+      return true;
+    }
+
+    const { data: existingLinksForDiscord } = await supabase
+      .from('discord_links')
+      .select('os_user_id, status')
+      .eq('discord_user_id', discordUserId)
+      .eq('status', 'linked');
+
+    const otherLink = existingLinksForDiscord?.find((l) => l.os_user_id && l.os_user_id !== osUserId);
+    if (otherLink) {
+      console.warn(`[codeVerification] Rejected 1:N link attempt: Discord account ${discordUserId} has active discord_links for OS user ${otherLink.os_user_id}`);
+      const errorMsg = await message.channel.send(
+        `❌ ${message.author} This Discord account is already connected to another ElevatesOS account. Each Discord account can only be linked to one ElevatesOS account. Please unlink your other account first.`
+      ).catch(() => null);
+      if (errorMsg) setTimeout(() => errorMsg.delete().catch(() => {}), 8000);
+      return true;
+    }
+
+    // Check 2: Is this ElevatesOS account already connected to a different Discord account?
+    const { data: currentOsProfile } = await supabase
+      .from('profiles')
+      .select('id, discord_user_id, discord_connected, full_name')
+      .eq('id', osUserId)
+      .maybeSingle();
+
+    if (
+      currentOsProfile?.discord_connected &&
+      currentOsProfile.discord_user_id &&
+      currentOsProfile.discord_user_id !== discordUserId
+    ) {
+      console.warn(`[codeVerification] Rejected N:1 link attempt: OS user ${osUserId} is already connected to Discord account ${currentOsProfile.discord_user_id}`);
+      const errorMsg = await message.channel.send(
+        `❌ ${message.author} Your ElevatesOS account is already connected to a different Discord account (<@${currentOsProfile.discord_user_id}>). Only one Discord account can be linked to your ElevatesOS account. Please unlink that account first.`
+      ).catch(() => null);
+      if (errorMsg) setTimeout(() => errorMsg.delete().catch(() => {}), 8000);
+      return true;
+    }
+
+    const { data: currentOsLinks } = await supabase
+      .from('discord_links')
+      .select('discord_user_id, status')
+      .eq('os_user_id', osUserId)
+      .eq('status', 'linked');
+
+    const otherDiscordLink = currentOsLinks?.find((l) => l.discord_user_id && l.discord_user_id !== discordUserId);
+    if (otherDiscordLink) {
+      console.warn(`[codeVerification] Rejected N:1 link attempt: OS user ${osUserId} has active discord_links for Discord account ${otherDiscordLink.discord_user_id}`);
+      const errorMsg = await message.channel.send(
+        `❌ ${message.author} Your ElevatesOS account is already connected to a different Discord account (<@${otherDiscordLink.discord_user_id}>). Only one Discord account can be linked to your ElevatesOS account. Please unlink that account first.`
+      ).catch(() => null);
+      if (errorMsg) setTimeout(() => errorMsg.delete().catch(() => {}), 8000);
+      return true;
+    }
+
     // Mark code row status = 'used'
     await supabase
       .from('discord_link_codes')
@@ -174,6 +244,20 @@ async function handleLinkServerMessage(message) {
 
     // Perform actual linking
     const now = new Date().toISOString();
+
+    // Clean up any stale or residual associations for this discordUserId or osUserId to guarantee 1:1
+    try {
+      await supabase
+        .from('profiles')
+        .update({
+          discord_connected: false,
+          discord_user_id: null,
+          discord_username: null,
+          updated_at: now,
+        })
+        .eq('discord_user_id', discordUserId)
+        .neq('id', osUserId);
+    } catch (_) {}
 
     // Update profiles table
     await supabase
@@ -208,6 +292,24 @@ async function handleLinkServerMessage(message) {
     const guildConfig = await api.getGuildConfig(message.guild.id).catch(() => null);
     const isMainServer = guildConfig?.guildType === 'main' || message.guild.id === config.mainGuildId;
 
+    // Fetch profile to verify chapter membership
+    const { data: userProfile } = await supabase
+      .from('profiles')
+      .select('chapter_id, role, full_name, discord_connected')
+      .eq('id', osUserId)
+      .maybeSingle();
+
+    if (!isMainServer) {
+      console.log(`[chapterRoleSync] Running code verification role sync for ${message.author.tag} (${discordUserId}) in chapter guild "${message.guild.name}" (${message.guild.id}, chapter_id: "${guildConfig?.chapterId}")`);
+      console.log(`[chapterRoleSync] OS profile read: user_id=${osUserId}, full_name="${userProfile?.full_name || 'N/A'}", role="${userProfile?.role || 'none'}", profile_chapter_id="${userProfile?.chapter_id || 'none'}"`);
+
+      const condition1_connected = true; // Just verified code
+      const condition2_matchingChapter = Boolean(guildConfig?.chapterId && userProfile?.chapter_id && guildConfig.chapterId === userProfile.chapter_id);
+      console.log(`[chapterRoleSync] Two-condition verification check for ${message.author.tag} in "${message.guild.name}":`);
+      console.log(`  - Condition 1 (OS Account Linked & Connected): PASS`);
+      console.log(`  - Condition 2 (Chapter Membership Match): ${condition2_matchingChapter ? 'PASS' : 'FAIL'} (guild.chapter_id="${guildConfig?.chapterId}", user.chapter_id="${userProfile?.chapter_id}")`);
+    }
+
     const member = message.member || (await message.guild.members.fetch(discordUserId).catch(() => null));
 
     // Assign Verified Member role
@@ -219,9 +321,28 @@ async function handleLinkServerMessage(message) {
       const verifiedRole = message.guild.roles.cache.find(
         (r) => r.name.toLowerCase().trim() === verifiedRoleName.toLowerCase().trim()
       );
+      console.log(`[chapterRoleSync] guild.roles.cache.find("${verifiedRoleName}") in "${message.guild.name}": ${verifiedRole ? `FOUND "${verifiedRole.name}" (id: ${verifiedRole.id}, position: ${verifiedRole.position})` : 'undefined'}`);
+
+      const botMember = message.guild.members?.me || (message.guild.members?.fetchMe ? await message.guild.members.fetchMe().catch(() => null) : null);
+      const botHighest = botMember?.roles?.highest;
+      if (botHighest && verifiedRole && verifiedRole.position !== undefined && botHighest.position !== undefined && verifiedRole.position >= botHighest.position) {
+        console.error(`[chapterRoleSync] ROLE HIERARCHY ERROR: Bot's highest role "${botHighest.name}" (position ${botHighest.position}) sits BELOW or EQUAL to target role "${verifiedRole.name}" (position ${verifiedRole.position}) in "${message.guild.name}". Bot lacks permission to assign this role!`);
+      }
 
       if (verifiedRole && !member.roles.cache.has(verifiedRole.id)) {
-        await member.roles.add(verifiedRole).catch(() => {});
+        try {
+          await member.roles.add(verifiedRole);
+          console.log(`[chapterRoleSync] SUCCESS: Added verified role "${verifiedRole.name}" (${verifiedRole.id}) to ${member.user?.tag || member.id} in "${message.guild.name}"`);
+        } catch (addErr) {
+          console.error(`[chapterRoleSync] FAILED to add verified role "${verifiedRole.name}" (${verifiedRole.id}) to ${member.user?.tag || member.id} in "${message.guild.name}":`, {
+            message: addErr.message,
+            code: addErr.code,
+            status: addErr.status,
+            isHierarchyIssue: Boolean(botHighest && verifiedRole.position !== undefined && botHighest.position !== undefined && verifiedRole.position >= botHighest.position || addErr.code === 50013),
+            botHighestRole: botHighest ? `${botHighest.name} (pos ${botHighest.position})` : 'unknown',
+            targetRole: `${verifiedRole.name} (pos ${verifiedRole.position})`,
+          });
+        }
       }
 
       // Remove Unverified role
@@ -229,8 +350,22 @@ async function handleLinkServerMessage(message) {
       const unverifiedRole = message.guild.roles.cache.find(
         (r) => r.name.toLowerCase().trim() === unverifiedRoleName
       );
+      console.log(`[chapterRoleSync] guild.roles.cache.find("${unverifiedRoleName}") in "${message.guild.name}": ${unverifiedRole ? `FOUND "${unverifiedRole.name}" (id: ${unverifiedRole.id}, position: ${unverifiedRole.position})` : 'undefined'}`);
+
       if (unverifiedRole && member.roles.cache.has(unverifiedRole.id)) {
-        await member.roles.remove(unverifiedRole).catch(() => {});
+        try {
+          await member.roles.remove(unverifiedRole);
+          console.log(`[chapterRoleSync] SUCCESS: Removed unverified role "${unverifiedRole.name}" (${unverifiedRole.id}) from ${member.user?.tag || member.id} in "${message.guild.name}"`);
+        } catch (remErr) {
+          console.error(`[chapterRoleSync] FAILED to remove unverified role "${unverifiedRole.name}" (${unverifiedRole.id}) from ${member.user?.tag || member.id} in "${message.guild.name}":`, {
+            message: remErr.message,
+            code: remErr.code,
+            status: remErr.status,
+            isHierarchyIssue: Boolean(botHighest && unverifiedRole.position !== undefined && botHighest.position !== undefined && unverifiedRole.position >= botHighest.position || remErr.code === 50013),
+            botHighestRole: botHighest ? `${botHighest.name} (pos ${botHighest.position})` : 'unknown',
+            targetRole: `${unverifiedRole.name} (pos ${unverifiedRole.position})`,
+          });
+        }
       }
     }
 

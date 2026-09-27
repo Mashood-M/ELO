@@ -49,18 +49,28 @@ supabase.from = function (table) {
       };
     },
     update: (updates) => {
-      return {
+      const updateFilters = [];
+      const updChain = {
         eq: (col, val) => {
+          updateFilters.push((row) => row[col] === val);
+          return updChain;
+        },
+        neq: (col, val) => {
+          updateFilters.push((row) => row[col] !== val);
+          return updChain;
+        },
+        then: (onFulfilled, onRejected) => {
           let updatedCount = 0;
           for (const row of currentTable) {
-            if (row[col] === val) {
+            if (updateFilters.every((fn) => fn(row))) {
               Object.assign(row, updates);
               updatedCount++;
             }
           }
-          return Promise.resolve({ data: updatedCount, error: null });
+          return Promise.resolve({ data: updatedCount, error: null }).then(onFulfilled, onRejected);
         },
       };
+      return updChain;
     },
     delete: () => {
       let deleteFilters = {};
@@ -100,6 +110,14 @@ supabase.from = function (table) {
     },
     eq: (col, val) => {
       filters.push((row) => row[col] === val);
+      return chain;
+    },
+    neq: (col, val) => {
+      filters.push((row) => row[col] !== val);
+      return chain;
+    },
+    is: (col, val) => {
+      filters.push((row) => (val === null ? row[col] === null || row[col] === undefined : row[col] === val));
       return chain;
     },
     gt: (col, val) => {
@@ -509,6 +527,154 @@ async function runTests() {
     await api.syncUserAcrossGuilds(mockClient, founderDiscordId, founderOsId);
     assert(!removedRoles.includes('ELEVATES • Founder'), 'ELEVATES • Founder role must NOT be removed from founder');
     assert(memberRoles.has(founderRole.id), 'Founder role must still be present on member');
+  });
+
+  // ==========================================================================
+  // SECTION 13: STRICT 1:1 ACCOUNT CONNECTION ENFORCEMENT
+  // ==========================================================================
+  await itAsync('Strict 1:1 Account Connection: Rejects linking when Discord account is already connected to another OS account', async () => {
+    resetDb();
+    codeVerification.resetRateLimit('user_discord_alice');
+
+    // Existing linked OS user Alice
+    mockDb.profiles.push({
+      id: 'os_user_alice',
+      full_name: 'Alice Smith',
+      discord_user_id: 'user_discord_alice',
+      discord_connected: true,
+    });
+
+    // Bob tries to link to Alice's Discord account
+    mockDb.profiles.push({
+      id: 'os_user_bob',
+      full_name: 'Bob Jones',
+      discord_user_id: null,
+      discord_connected: false,
+    });
+
+    const bobCode = 'BOB123';
+    mockDb.discord_link_codes.push({
+      id: 'code_bob',
+      user_id: 'os_user_bob',
+      code: bobCode,
+      status: 'pending',
+      expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    });
+
+    let sentMessage = null;
+    let messageDeleted = false;
+    const mockMessage = {
+      content: bobCode,
+      author: { id: 'user_discord_alice', tag: 'Alice#0001', bot: false, toString: () => '<@user_discord_alice>' },
+      channel: {
+        name: 'link-server',
+        send: async (text) => {
+          sentMessage = text;
+          return { delete: async () => {} };
+        },
+      },
+      guild: { id: 'guild_1' },
+      delete: async () => { messageDeleted = true; },
+      client: { guilds: { cache: new Collection() } },
+    };
+
+    const handled = await codeVerification.handleLinkServerMessage(mockMessage);
+    assert.strictEqual(handled, true, 'Message should be handled');
+    assert.strictEqual(messageDeleted, true, 'Security: Message must be deleted immediately');
+    assert(sentMessage.includes('already connected to another ElevatesOS account'), 'Must reject with 1:1 conflict warning');
+
+    // Ensure Bob's code was NOT consumed
+    const codeRow = mockDb.discord_link_codes.find((c) => c.id === 'code_bob');
+    assert.strictEqual(codeRow.status, 'pending', 'Code must remain pending');
+
+    // Ensure Bob was NOT linked to Alice's Discord account
+    const bobProfile = mockDb.profiles.find((p) => p.id === 'os_user_bob');
+    assert.strictEqual(bobProfile.discord_connected, false, 'Bob must remain unconnected');
+    assert.strictEqual(bobProfile.discord_user_id, null, 'Bob must not have Alice Discord ID');
+  });
+
+  await itAsync('Strict 1:1 Account Connection: Rejects linking when OS account is already connected to a different Discord account', async () => {
+    resetDb();
+    codeVerification.resetRateLimit('user_discord_new');
+
+    // OS user Charlie is already connected to Discord user CharlieOld
+    mockDb.profiles.push({
+      id: 'os_user_charlie',
+      full_name: 'Charlie Brown',
+      discord_user_id: 'user_discord_charlie_old',
+      discord_connected: true,
+    });
+
+    const charlieCode = 'CHA789';
+    mockDb.discord_link_codes.push({
+      id: 'code_charlie',
+      user_id: 'os_user_charlie',
+      code: charlieCode,
+      status: 'pending',
+      expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    });
+
+    let sentMessage = null;
+    let messageDeleted = false;
+    const mockMessage = {
+      content: charlieCode,
+      author: { id: 'user_discord_new', tag: 'NewDiscord#0001', bot: false, toString: () => '<@user_discord_new>' },
+      channel: {
+        name: 'link-server',
+        send: async (text) => {
+          sentMessage = text;
+          return { delete: async () => {} };
+        },
+      },
+      guild: { id: 'guild_1' },
+      delete: async () => { messageDeleted = true; },
+      client: { guilds: { cache: new Collection() } },
+    };
+
+    const handled = await codeVerification.handleLinkServerMessage(mockMessage);
+    assert.strictEqual(handled, true, 'Message should be handled');
+    assert.strictEqual(messageDeleted, true, 'Security: Message must be deleted immediately');
+    assert(sentMessage.includes('already connected to a different Discord account'), 'Must reject with N:1 conflict warning');
+
+    // Ensure code was NOT consumed
+    const codeRow = mockDb.discord_link_codes.find((c) => c.id === 'code_charlie');
+    assert.strictEqual(codeRow.status, 'pending', 'Code must remain pending');
+
+    // Ensure Charlie was NOT overwritten
+    const charlieProfile = mockDb.profiles.find((p) => p.id === 'os_user_charlie');
+    assert.strictEqual(charlieProfile.discord_user_id, 'user_discord_charlie_old', 'Must keep original Discord user ID');
+  });
+
+  await itAsync('Strict 1:1 Account Connection: getIdentityByDiscordId auto-disconnects duplicate older profiles sharing same Discord ID', async () => {
+    resetDb();
+
+    // Two OS profiles accidentally sharing the same Discord ID in DB (legacy drift)
+    mockDb.profiles.push({
+      id: 'os_older_dup',
+      full_name: 'Old Account',
+      discord_user_id: 'shared_discord_id',
+      discord_connected: true,
+      discord_connected_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    mockDb.profiles.push({
+      id: 'os_newer_primary',
+      full_name: 'Primary Account',
+      discord_user_id: 'shared_discord_id',
+      discord_connected: true,
+      discord_connected_at: '2026-02-01T00:00:00.000Z',
+      updated_at: '2026-02-01T00:00:00.000Z',
+    });
+
+    const identity = await api.getIdentityByDiscordId('shared_discord_id');
+    assert(identity, 'Identity must be resolved');
+    assert.strictEqual(identity.userId, 'os_newer_primary', 'Should resolve latest primary OS account');
+
+    // Older duplicate profile must have been auto-disconnected to enforce 1:1
+    const olderProfile = mockDb.profiles.find((p) => p.id === 'os_older_dup');
+    assert.strictEqual(olderProfile.discord_connected, false, 'Older duplicate must be disconnected');
+    assert.strictEqual(olderProfile.discord_user_id, null, 'Older duplicate discord_user_id must be null');
   });
 
   console.log(`\n========================================`);

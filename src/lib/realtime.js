@@ -9,21 +9,39 @@ const {
   handleMemberAdded,
   handleMemberRemoved,
   handleUserLinked,
+  processClusterInsert,
+  reconcileUnprovisionedClusters,
+  reconcileAllClusters,
+  reconcileClusterMembers,
+  invalidateClusterCache,
+  setUserToDiscordCache,
+  invalidateUserToDiscordCache,
 } = require('./clusterSync');
 const { ensureLinkChannel } = require('./accountLinking');
 const { checkMainGuildRoleSanity } = require('./roleSanityCheck');
 
 let lastReconcileTime = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-let pollCycleCounter = 0;
 const userRoleToUserMap = new Map(); // id -> user_id for tracking DELETE events
 const osUserToDiscordMap = new Map(); // osUserId -> discordUserId
 const discordLinkToUserMap = new Map(); // linkId -> { discordUserId, osUserId, status }
+const clusterKnownMembersCache = new Map(); // clusterId -> string[] member_ids
+// Short-lived cluster metadata cache to avoid repeated Supabase lookups in event handlers
+const clusterMetaCache = new Map(); // clusterId -> { name, chapter_id, cachedAt }
+const CLUSTER_META_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 let activeRealtimeChannel = null;
 let isRealtimeSubscribed = false;
 let isReconnecting = false;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
+
+let lastKnownGoodConnection = null;
+let lastDisconnectedAt = null;
+let lastReconnectedAt = null;
+let lastDisconnectReason = null;
+
+let reconciliationIntervalTimer = null;
+let isReconciliationRunning = false;
 
 /**
  * Initializes Supabase Realtime listeners and a resilient polling reconciliation loop
@@ -101,18 +119,14 @@ function initRealtimeSync(client) {
     })
     .catch(() => {});
 
-  // Initial sync of all clusters
-  syncAllClusters(client).catch((err) =>
-    console.error('[RealtimeSync] Initial cluster sync error:', err.message)
-  );
-
-  // Initial sync of all connected users to reconcile any role changes that occurred while offline
-  reconcileAllConnectedUsers(client).catch((err) =>
-    console.error('[RealtimeSync] Initial user sync error:', err.message)
+  // Initial full reconciliation: provisions unprovisioned clusters, resolves pending roles, syncs users & cleans unlinked, deduplicates categories
+  runFullReconciliation(client).catch((err) =>
+    console.error('[RealtimeSync] Initial full reconciliation error:', err.message)
   );
 
   setupRealtimeChannel(client);
   startPollingLoop(client);
+  startReconciliationInterval(client);
 }
 
 /**
@@ -165,9 +179,11 @@ function setupRealtimeChannel(client) {
 
             if (isDisconnected && userId) {
               osUserToDiscordMap.delete(userId);
+              invalidateUserToDiscordCache(userId);
             }
             if (newRow?.discord_connected && newRow?.discord_user_id && userId) {
               osUserToDiscordMap.set(userId, newRow.discord_user_id);
+              setUserToDiscordCache(userId, newRow.discord_user_id);
             }
 
             // Check if designation or role changed
@@ -374,56 +390,60 @@ function setupRealtimeChannel(client) {
 
             console.log(`[RealtimeSync] Clusters change detected for cluster ${clusterId} (${payload.eventType})`);
 
-            if (payload.eventType === 'INSERT') {
-              await handleClusterCreated(client, payload.new);
+            // Keep cluster metadata cache fresh from the payload (free data we already have)
+            if (payload.new?.name || payload.new?.chapter_id) {
+              clusterMetaCache.set(clusterId, {
+                name: payload.new.name,
+                chapter_id: payload.new.chapter_id,
+                cachedAt: Date.now(),
+              });
+            } else if (payload.eventType === 'DELETE' || payload.eventType === 'archived') {
+              clusterMetaCache.delete(clusterId);
+            }
 
-              // Initial member_ids sync on cluster creation
-              if (Array.isArray(payload.new?.member_ids)) {
-                for (const uId of payload.new.member_ids) {
-                  await handleMemberAdded(client, {
+            if (payload.eventType === 'INSERT') {
+              await processClusterInsert(client, payload.new);
+            } else if (payload.eventType === 'UPDATE' && payload.new?.status === 'archived' && payload.old?.status !== 'archived') {
+              invalidateClusterCache(clusterId);
+              clusterMetaCache.delete(clusterId);
+              await handleClusterArchived(client, payload.new);
+            } else if (payload.eventType === 'UPDATE') {
+              invalidateClusterCache(clusterId);
+              // 1. Membership sync via member_ids array diffing in parallel
+              const cachedKnownMembers = clusterKnownMembersCache.get(clusterId);
+              const oldMembers = Array.isArray(payload.old?.member_ids)
+                ? payload.old.member_ids
+                : (Array.isArray(cachedKnownMembers) ? cachedKnownMembers : []);
+              const newMembers = Array.isArray(payload.new?.member_ids) ? payload.new.member_ids : [];
+              if (newMembers.length > 0) {
+                clusterKnownMembersCache.set(clusterId, newMembers);
+              }
+
+              // user_id in NEW.member_ids but not OLD.member_ids -> member add
+              const addedUserIds = newMembers.filter((u) => !oldMembers.includes(u));
+              await Promise.all(
+                addedUserIds.map(async (uId) => {
+                  console.log(`[RealtimeSync] Member added to cluster ${clusterId} via array diff: ${uId}`);
+                  return handleMemberAdded(client, {
                     cluster_id: clusterId,
                     user_id: uId,
                     role_in_cluster: 'member',
                   });
-                }
-              }
-
-              // Initial leader sync
-              if (payload.new?.leader_id) {
-                await handleMemberAdded(client, {
-                  cluster_id: clusterId,
-                  user_id: payload.new.leader_id,
-                  role_in_cluster: 'host',
-                });
-              }
-            } else if (payload.eventType === 'UPDATE' && payload.new?.status === 'archived' && payload.old?.status !== 'archived') {
-              await handleClusterArchived(client, payload.new);
-            } else if (payload.eventType === 'UPDATE') {
-              // 1. Membership sync via member_ids array diffing
-              const oldMembers = Array.isArray(payload.old?.member_ids) ? payload.old.member_ids : [];
-              const newMembers = Array.isArray(payload.new?.member_ids) ? payload.new.member_ids : [];
-
-              // user_id in NEW.member_ids but not OLD.member_ids -> member add
-              const addedUserIds = newMembers.filter((u) => !oldMembers.includes(u));
-              for (const uId of addedUserIds) {
-                console.log(`[RealtimeSync] Member added to cluster ${clusterId} via array diff: ${uId}`);
-                await handleMemberAdded(client, {
-                  cluster_id: clusterId,
-                  user_id: uId,
-                  role_in_cluster: 'member',
-                });
-              }
+                })
+              );
 
               // user_id in OLD.member_ids but not NEW.member_ids -> member removal
               const removedUserIds = oldMembers.filter((u) => !newMembers.includes(u));
-              for (const uId of removedUserIds) {
-                console.log(`[RealtimeSync] Member removed from cluster ${clusterId} via array diff: ${uId}`);
-                await handleMemberRemoved(client, {
-                  cluster_id: clusterId,
-                  user_id: uId,
-                  role_in_cluster: 'member',
-                });
-              }
+              await Promise.all(
+                removedUserIds.map(async (uId) => {
+                  console.log(`[RealtimeSync] Member removed from cluster ${clusterId} via array diff: ${uId}`);
+                  return handleMemberRemoved(client, {
+                    cluster_id: clusterId,
+                    user_id: uId,
+                    role_in_cluster: 'member',
+                  });
+                })
+              );
 
               // 2. Host-role logic via leader_id compare on UPDATE
               const oldLeaderId = payload.old?.leader_id;
@@ -445,6 +465,11 @@ function setupRealtimeChannel(client) {
                 });
               }
 
+              // 3. Full cluster reconciliation to guarantee exact role sync and category permission privacy
+              await reconcileClusterMembers(client, clusterId).catch((rErr) =>
+                console.warn(`[RealtimeSync] Error in reconcileClusterMembers for cluster ${clusterId}:`, rErr.message)
+              );
+
               // If name or access_mode changed, re-sync cluster structure
               if (
                 payload.new?.name !== payload.old?.name ||
@@ -453,24 +478,28 @@ function setupRealtimeChannel(client) {
               ) {
                 await syncCluster(client, clusterId);
               }
+            } else if (payload.eventType === 'DELETE') {
+              invalidateClusterCache(clusterId);
             }
 
-            const chapterId = payload.new?.chapter_id || payload.old?.chapter_id;
-            if (chapterId) {
-              const clusterName = payload.new?.name || payload.old?.name || 'Cluster';
-              const logType = payload.eventType === 'INSERT' ? 'cluster_created' : payload.eventType === 'DELETE' ? 'cluster_deleted' : 'cluster_updated';
-              await api.logChapterEvent(
-                client,
-                chapterId,
-                null,
-                logType,
-                {
-                  cluster: clusterName,
-                  status: payload.new?.status || 'active',
-                  change_type: payload.eventType,
-                },
-                'cluster_activity'
-              );
+            if (payload.eventType !== 'INSERT') {
+              const chapterId = payload.new?.chapter_id || payload.old?.chapter_id;
+              if (chapterId) {
+                const clusterName = payload.new?.name || payload.old?.name || 'Cluster';
+                const logType = payload.eventType === 'DELETE' ? 'cluster_deleted' : 'cluster_updated';
+                await api.logChapterEvent(
+                  client,
+                  chapterId,
+                  null,
+                  logType,
+                  {
+                    cluster: clusterName,
+                    status: payload.new?.status || 'active',
+                    change_type: payload.eventType,
+                  },
+                  'cluster_activity'
+                );
+              }
             }
           } catch (err) {
             console.error('[RealtimeSync] Error processing clusters change:', err);
@@ -488,17 +517,27 @@ function setupRealtimeChannel(client) {
 
             console.log(`[RealtimeSync] cluster_members change detected for cluster ${clusterId} (${payload.eventType})`);
 
-            if (payload.eventType === 'INSERT') {
-              await handleMemberAdded(client, payload.new);
-            } else if (payload.eventType === 'DELETE') {
-              await handleMemberRemoved(client, payload.old);
-            } else {
-              await syncCluster(client, clusterId);
-            }
+            const userId = payload.new?.user_id || payload.old?.user_id;
 
-            const { data: clData } = await supabase.from('clusters').select('name, chapter_id').eq('id', clusterId).maybeSingle();
+            // Run member action + cluster meta fetch in parallel (meta uses cache when available)
+            const [, clData] = await Promise.all([
+              payload.eventType === 'INSERT' || payload.eventType === 'UPDATE'
+                ? handleMemberAdded(client, payload.new)
+                : payload.eventType === 'DELETE'
+                ? handleMemberRemoved(client, payload.old)
+                : syncCluster(client, clusterId),
+              (async () => {
+                const cached = clusterMetaCache.get(clusterId);
+                if (cached && Date.now() - cached.cachedAt < CLUSTER_META_CACHE_TTL_MS) {
+                  return cached;
+                }
+                const { data } = await supabase.from('clusters').select('name, chapter_id').eq('id', clusterId).maybeSingle();
+                if (data) clusterMetaCache.set(clusterId, { ...data, cachedAt: Date.now() });
+                return data;
+              })(),
+            ]);
+
             if (clData?.chapter_id) {
-              const userId = payload.new?.user_id || payload.old?.user_id;
               let memberStr = 'Member';
               if (userId) {
                 const { data: p } = await supabase.from('profiles').select('full_name, discord_user_id').eq('id', userId).maybeSingle();
@@ -508,7 +547,7 @@ function setupRealtimeChannel(client) {
               }
 
               const logType = payload.eventType === 'INSERT' ? 'cluster_member_added' : payload.eventType === 'DELETE' ? 'cluster_member_removed' : 'cluster_member_updated';
-              await api.logChapterEvent(
+              api.logChapterEvent(
                 client,
                 clData.chapter_id,
                 null,
@@ -520,7 +559,7 @@ function setupRealtimeChannel(client) {
                   change_type: payload.eventType,
                 },
                 'cluster_activity'
-              );
+              ).catch(() => {});
             }
           } catch (err) {
             console.error('[RealtimeSync] Error processing cluster_members change:', err);
@@ -536,6 +575,31 @@ function setupRealtimeChannel(client) {
             const row = payload.new;
             if (row && row.status === 'verified') {
               console.log(`[RealtimeSync] OTP verified on web for user ${row.os_user_id} (${row.discord_user_id})`);
+              // Ensure any other OS profile holding this discord_user_id is disconnected (enforce 1:1)
+              if (row.discord_user_id && row.os_user_id) {
+                try {
+                  await supabase
+                    .from('profiles')
+                    .update({
+                      discord_connected: false,
+                      discord_user_id: null,
+                      discord_username: null,
+                      updated_at: new Date().toISOString(),
+                    })
+                    .eq('discord_user_id', row.discord_user_id)
+                    .neq('id', row.os_user_id);
+
+                  await supabase
+                    .from('discord_links')
+                    .update({
+                      status: 'unlinked',
+                      unlinked_at: new Date().toISOString(),
+                      updated_at: new Date().toISOString(),
+                    })
+                    .eq('discord_user_id', row.discord_user_id)
+                    .neq('os_user_id', row.os_user_id);
+                } catch (_) {}
+              }
               await handleUserLinked(client, { os_user_id: row.os_user_id, discord_user_id: row.discord_user_id });
               await api.syncUserAcrossGuilds(client, row.discord_user_id, row.os_user_id);
             }
@@ -562,6 +626,7 @@ function setupRealtimeChannel(client) {
               });
               if (payload.new.os_user_id && payload.new.discord_user_id && status === 'linked') {
                 osUserToDiscordMap.set(payload.new.os_user_id, payload.new.discord_user_id);
+                setUserToDiscordCache(payload.new.os_user_id, payload.new.discord_user_id);
               }
             }
 
@@ -579,7 +644,10 @@ function setupRealtimeChannel(client) {
             }
 
             if (status === 'unlinked' || payload.eventType === 'DELETE') {
-              if (osUserId) osUserToDiscordMap.delete(osUserId);
+              if (osUserId) {
+                osUserToDiscordMap.delete(osUserId);
+                invalidateUserToDiscordCache(osUserId);
+              }
             }
 
             if (discordUserId || osUserId) {
@@ -845,19 +913,54 @@ function setupRealtimeChannel(client) {
       )
       .subscribe((status, err) => {
         if (status === 'SUBSCRIBED') {
-          const wasReconnecting = reconnectAttempts > 0;
+          const wasReconnecting = reconnectAttempts > 0 || Boolean(lastDisconnectedAt);
           isRealtimeSubscribed = true;
           reconnectAttempts = 0;
-          console.log('[RealtimeSync] Successfully subscribed to all Supabase Realtime change feeds.');
+          const reconnectedTime = new Date().toISOString();
+
           if (wasReconnecting) {
-            reconcileRecentChanges(client).catch(() => {});
+            lastReconnectedAt = reconnectedTime;
+            const outageDurationMs = lastDisconnectedAt
+              ? (new Date(lastReconnectedAt).getTime() - new Date(lastDisconnectedAt).getTime())
+              : null;
+            const outageStr = outageDurationMs !== null
+              ? `${outageDurationMs}ms (${(outageDurationMs / 1000).toFixed(1)}s)`
+              : 'unknown duration';
+
+            console.log(
+              `[RealtimeSync] ✅ Realtime connection RESTORED. ` +
+              `[Disconnect Window] Last known good connection: ${lastKnownGoodConnection || 'N/A'}, ` +
+              `Disconnected at: ${lastDisconnectedAt || 'unknown'}, ` +
+              `Reconnected at: ${lastReconnectedAt} (Outage window: ${outageStr}).`
+            );
+
+            // Self-heal: immediately trigger full reconciliation to catch up on any events missed during disconnect window
+            runFullReconciliation(client).catch((recErr) =>
+              console.error('[RealtimeSync] Error running reconciliation after reconnect:', recErr.message)
+            );
+          } else {
+            console.log(`[RealtimeSync] ✅ Successfully subscribed to all Supabase Realtime change feeds. Initial connection established at: ${reconnectedTime}`);
           }
-        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+
+          lastKnownGoodConnection = reconnectedTime;
+          lastDisconnectedAt = null;
+          lastDisconnectReason = null;
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED' || status === 'DISCONNECTED') {
           isRealtimeSubscribed = false;
-          console.warn(`[RealtimeSync] Realtime channel status: ${status} (${err?.message || 'glitch'}). Auto-reconnecting via supervisor...`);
+          lastDisconnectedAt = new Date().toISOString();
+          lastDisconnectReason = `${status}${err?.message ? ` - ${err.message}` : ''}`;
+
+          console.warn(
+            `[RealtimeSync] ⚠️ Realtime connection DISCONNECTED / ERROR. Status: ${status} (${err?.message || 'transport failure'}). ` +
+            `[Disconnect Window] Last known good connection: ${lastKnownGoodConnection || 'N/A'}, Disconnected at: ${lastDisconnectedAt}. ` +
+            `Auto-reconnecting via supervisor...`
+          );
           scheduleReconnect(client);
         } else if (err) {
-          console.warn('[RealtimeSync] Realtime subscription notice:', status, err?.message || '');
+          console.warn(
+            `[RealtimeSync] Realtime subscription notice: ${status}, error: ${err.message || ''}. ` +
+            `Last known good connection: ${lastKnownGoodConnection || 'N/A'}`
+          );
         }
       });
 
@@ -929,98 +1032,96 @@ async function reconcileRecentChanges(client) {
   const checkTime = new Date().toISOString();
 
   try {
-    // 1. Fetch profiles updated since last check
-    const { data: updatedProfiles } = await supabase
-      .from('profiles')
-      .select('id, discord_user_id, discord_connected, updated_at')
-      .gt('updated_at', lastReconcileTime)
-      .not('discord_user_id', 'is', null)
-      .limit(50);
+    // Run all 5 DB queries in parallel — they are fully independent
+    const [
+      { data: updatedProfiles },
+      { data: verifiedCodes },
+      { data: recentRoles },
+      { data: recentChapters },
+      { data: recentUnlinks },
+    ] = await Promise.all([
+      supabase
+        .from('profiles')
+        .select('id, discord_user_id, discord_connected, updated_at')
+        .gt('updated_at', lastReconcileTime)
+        .not('discord_user_id', 'is', null)
+        .limit(50),
+      supabase
+        .from('discord_verification_codes')
+        .select('os_user_id, discord_user_id, verified_at')
+        .eq('status', 'verified')
+        .gt('verified_at', lastReconcileTime)
+        .limit(25),
+      supabase
+        .from('user_roles')
+        .select('user_id, role_key, role, chapter_id, created_at')
+        .gt('created_at', lastReconcileTime)
+        .limit(25),
+      supabase
+        .from('chapters')
+        .select('id, campus_lead_id, updated_at')
+        .gt('updated_at', lastReconcileTime)
+        .limit(10),
+      supabase
+        .from('discord_links')
+        .select('os_user_id, discord_user_id, unlinked_at')
+        .eq('status', 'unlinked')
+        .gt('unlinked_at', lastReconcileTime)
+        .limit(25),
+    ]);
 
-    if (updatedProfiles && updatedProfiles.length > 0) {
+    // Collect unique user IDs to sync — deduplicating across all change sources
+    const usersToSync = new Map(); // discordUserId/osUserId -> { discordUserId, osUserId }
+
+    if (updatedProfiles) {
       for (const p of updatedProfiles) {
-        if (p.discord_user_id) {
-          await api.syncUserAcrossGuilds(client, p.discord_user_id, p.id, null, 'high');
-        }
+        if (p.discord_user_id) usersToSync.set(p.discord_user_id, { discordUserId: p.discord_user_id, osUserId: p.id });
       }
     }
-
-    // 2. Fetch recent verified codes
-    const { data: verifiedCodes } = await supabase
-      .from('discord_verification_codes')
-      .select('os_user_id, discord_user_id, verified_at')
-      .eq('status', 'verified')
-      .gt('verified_at', lastReconcileTime)
-      .limit(25);
-
-    if (verifiedCodes && verifiedCodes.length > 0) {
+    if (verifiedCodes) {
       for (const c of verifiedCodes) {
-        if (c.discord_user_id) {
-          await api.syncUserAcrossGuilds(client, c.discord_user_id, c.os_user_id, null, 'high');
-        }
+        if (c.discord_user_id) usersToSync.set(c.discord_user_id, { discordUserId: c.discord_user_id, osUserId: c.os_user_id });
       }
     }
-
-    // 3. Fetch recently added or changed user_roles
-    const { data: recentRoles } = await supabase
-      .from('user_roles')
-      .select('user_id, role_key, role, chapter_id, created_at')
-      .gt('created_at', lastReconcileTime)
-      .limit(25);
-
-    if (recentRoles && recentRoles.length > 0) {
+    if (recentRoles) {
       for (const r of recentRoles) {
-        if (r.user_id) {
-          await api.syncUserAcrossGuilds(client, null, r.user_id, null, 'high');
-        }
+        if (r.user_id && !usersToSync.has(r.user_id)) usersToSync.set(r.user_id, { discordUserId: null, osUserId: r.user_id });
       }
     }
-
-    // 4. Fetch recently updated chapters (campus_lead assignments)
-    const { data: recentChapters } = await supabase
-      .from('chapters')
-      .select('campus_lead_id, updated_at')
-      .gt('updated_at', lastReconcileTime)
-      .limit(10);
-
-    if (recentChapters && recentChapters.length > 0) {
+    if (recentChapters) {
       for (const ch of recentChapters) {
-        if (ch.campus_lead_id) {
-          await api.syncUserAcrossGuilds(client, null, ch.campus_lead_id, null, 'high');
-        }
+        if (ch.campus_lead_id && !usersToSync.has(ch.campus_lead_id)) usersToSync.set(ch.campus_lead_id, { discordUserId: null, osUserId: ch.campus_lead_id });
       }
     }
-    // 5. Fetch recently unlinked identities
-    const { data: recentUnlinks } = await supabase
-      .from('discord_links')
-      .select('os_user_id, discord_user_id, unlinked_at')
-      .eq('status', 'unlinked')
-      .gt('unlinked_at', lastReconcileTime)
-      .limit(25);
-
-    if (recentUnlinks && recentUnlinks.length > 0) {
+    if (recentUnlinks) {
       for (const u of recentUnlinks) {
-        if (u.discord_user_id) {
-          await api.syncUserAcrossGuilds(client, u.discord_user_id, u.os_user_id, null, 'high');
-        }
+        if (u.discord_user_id) usersToSync.set(u.discord_user_id, { discordUserId: u.discord_user_id, osUserId: u.os_user_id });
       }
     }
 
-    // 6. Update live rosters for chapters that had role or lead changes
+    // Sync all changed users in parallel (capped at 10 concurrent to avoid Discord rate limits)
+    const syncEntries = Array.from(usersToSync.values());
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < syncEntries.length; i += BATCH_SIZE) {
+      const batch = syncEntries.slice(i, i + BATCH_SIZE);
+      await Promise.all(
+        batch.map(({ discordUserId, osUserId }) =>
+          api.syncUserAcrossGuilds(client, discordUserId, osUserId, null, 'high').catch(() => {})
+        )
+      );
+    }
+
+    // Update live rosters for chapters that had role or lead changes (deduped)
     const chaptersToUpdate = new Set();
-    if (recentRoles && recentRoles.length > 0) {
-      for (const r of recentRoles) {
-        if (r.chapter_id) chaptersToUpdate.add(r.chapter_id);
-      }
+    if (recentRoles) {
+      for (const r of recentRoles) { if (r.chapter_id) chaptersToUpdate.add(r.chapter_id); }
     }
-    if (recentChapters && recentChapters.length > 0) {
-      for (const ch of recentChapters) {
-        if (ch.id) chaptersToUpdate.add(ch.id);
-      }
+    if (recentChapters) {
+      for (const ch of recentChapters) { if (ch.id) chaptersToUpdate.add(ch.id); }
     }
-    for (const chId of chaptersToUpdate) {
-      await api.updateChapterCurrentRolesTopic(client, chId).catch(() => {});
-    }
+    await Promise.all(
+      Array.from(chaptersToUpdate).map((chId) => api.updateChapterCurrentRolesTopic(client, chId).catch(() => {}))
+    );
   } catch (err) {
     console.error('[PollingLoop] Error in reconcileRecentChanges:', err.message);
   }
@@ -1046,62 +1147,505 @@ async function refreshAllChapterRosters(client) {
 }
 
 /**
- * Synchronizes all currently linked Discord users across all guilds on startup.
+ * Resolves all pending discord roles that are now resolvable (user is linked and in-guild).
+ *
+ * @param {import('discord.js').Client} client
+ * @returns {Promise<number>} Number of resolved roles
  */
-async function reconcileAllConnectedUsers(client) {
+async function resolveAllPendingRoles(client) {
+  if (!client || !supabase) return 0;
+
   try {
+    const { data: pendingRows, error } = await supabase
+      .from('pending_discord_roles')
+      .select('*');
+
+    if (error) {
+      console.error('[PendingRolesReconciliation] Error querying pending_discord_roles:', error.message);
+      return 0;
+    }
+
+    if (!pendingRows || pendingRows.length === 0) {
+      return 0;
+    }
+
+    console.log(`[PendingRolesReconciliation] Found ${pendingRows.length} pending role(s) to evaluate.`);
+
+    // Group pending rows by user_id
+    const userPendingMap = new Map();
+    for (const row of pendingRows) {
+      if (!row.user_id) continue;
+      if (!userPendingMap.has(row.user_id)) {
+        userPendingMap.set(row.user_id, []);
+      }
+      userPendingMap.get(row.user_id).push(row);
+    }
+
+    let resolvedCount = 0;
+    for (const [userId, rows] of userPendingMap) {
+      try {
+        let discordUserId = osUserToDiscordMap.get(userId);
+
+        if (!discordUserId) {
+          // Check discord_links
+          const { data: link } = await supabase
+            .from('discord_links')
+            .select('discord_user_id')
+            .eq('os_user_id', userId)
+            .eq('status', 'linked')
+            .order('linked_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (link?.discord_user_id) {
+            discordUserId = link.discord_user_id;
+            osUserToDiscordMap.set(userId, discordUserId);
+          }
+        }
+
+        if (!discordUserId) {
+          // Check profiles
+          const { data: prof } = await supabase
+            .from('profiles')
+            .select('discord_user_id, discord_connected')
+            .eq('id', userId)
+            .maybeSingle();
+
+          if (prof?.discord_connected && prof.discord_user_id) {
+            discordUserId = prof.discord_user_id;
+            osUserToDiscordMap.set(userId, discordUserId);
+          }
+        }
+
+        if (!discordUserId) {
+          // User is not yet linked to Discord; retain pending role row
+          continue;
+        }
+
+        // Delegate to handleUserLinked to process all pending rows for this user
+        await handleUserLinked(client, { os_user_id: userId, discord_user_id: discordUserId });
+        resolvedCount += rows.length;
+      } catch (userErr) {
+        console.error(`[PendingRolesReconciliation] Error resolving pending roles for user ${userId}:`, userErr.message);
+      }
+    }
+
+    return resolvedCount;
+  } catch (err) {
+    console.error('[PendingRolesReconciliation] Unexpected error:', err.message);
+    return 0;
+  }
+}
+
+/**
+ * Standalone full reconciliation function.
+ * Called on bot startup, immediately following reconnection, and on a resilient periodic interval.
+ * Heals drift in:
+ * 1. Clusters where discord_category_id IS NULL (never provisioned)
+ * 2. Pending discord roles that are now resolvable (user is linked and in-guild)
+ * 3. Connected user roles (missing roles granted, removed roles revoked across main and chapter servers)
+ * 4. Unlinked / disconnected user role cleanup (strips OS & verified roles, assigns Unverified)
+ * 5. Cluster memberships (member_ids array diffing)
+ * 6. Live chapter rosters in 👥 Current Roles
+ *
+ * Designed for scale: avoids full guild.members.fetch() across all guilds on routine interval runs.
+ * Compares against Supabase state first and only touches the Discord API for entries needing correction.
+ *
+ * @param {import('discord.js').Client} client
+ * @returns {Promise<object>} Summary of reconciliation results
+ */
+async function runFullReconciliation(client) {
+  if (!client || !supabase) {
+    return { ok: false, reason: 'Client or Supabase unavailable' };
+  }
+
+  const startTime = Date.now();
+  console.log('[Reconciliation] === Starting full reconciliation pass ===');
+
+  const results = {
+    unprovisionedClustersProcessed: 0,
+    pendingRolesResolved: 0,
+    connectedUsersSynced: 0,
+    unlinkedUsersCleaned: 0,
+    clustersReconciled: 0,
+    durationMs: 0,
+  };
+
+  try {
+    // 1. Reconcile unprovisioned clusters (clusters where discord_category_id IS NULL)
+    try {
+      const unprovisioned = await reconcileUnprovisionedClusters(client);
+      results.unprovisionedClustersProcessed = Array.isArray(unprovisioned) ? unprovisioned.length : 0;
+    } catch (clustErr) {
+      console.error('[Reconciliation] Error reconciling unprovisioned clusters:', clustErr.message);
+    }
+
+    // 2. Resolve pending discord_roles that are now resolvable
+    try {
+      results.pendingRolesResolved = await resolveAllPendingRoles(client);
+    } catch (pendErr) {
+      console.error('[Reconciliation] Error resolving pending roles:', pendErr.message);
+    }
+
+    // 3. Compare against Supabase state first for user identities and roles
     const { data: connectedProfiles } = await supabase
       .from('profiles')
-      .select('id, discord_user_id')
+      .select('id, discord_user_id, discord_connected_at, updated_at, full_name')
       .eq('discord_connected', true)
       .not('discord_user_id', 'is', null);
 
-    const connectedDiscordIds = new Set();
-    if (connectedProfiles && connectedProfiles.length > 0) {
-      console.log(`[RealtimeSync] Syncing ${connectedProfiles.length} connected user(s)...`);
+    const { data: activeLinks } = await supabase
+      .from('discord_links')
+      .select('os_user_id, discord_user_id')
+      .eq('status', 'linked');
+
+    // Enforce strictly 1:1 account connection:
+    // If multiple OS profiles share the same Discord ID, keep only the latest and disconnect duplicates.
+    const discordToProfiles = new Map(); // discord_user_id -> profile[]
+    if (connectedProfiles) {
       for (const p of connectedProfiles) {
-        if (p.discord_user_id) {
-          connectedDiscordIds.add(p.discord_user_id);
-          await api.syncUserAcrossGuilds(client, p.discord_user_id, p.id, null, 'low');
+        if (!p.discord_user_id) continue;
+        if (!discordToProfiles.has(p.discord_user_id)) {
+          discordToProfiles.set(p.discord_user_id, []);
+        }
+        discordToProfiles.get(p.discord_user_id).push(p);
+      }
+    }
+
+    const connectedUserMap = new Map(); // discordUserId -> osUserId
+    for (const [dUserId, profileList] of discordToProfiles) {
+      if (profileList.length === 1) {
+        connectedUserMap.set(dUserId, profileList[0].id);
+        osUserToDiscordMap.set(profileList[0].id, dUserId);
+      } else {
+        // Multiple OS profiles for one Discord account: sort latest first, keep primary, disconnect duplicates
+        profileList.sort((a, b) => {
+          const tA = new Date(a.discord_connected_at || a.updated_at || 0).getTime();
+          const tB = new Date(b.discord_connected_at || b.updated_at || 0).getTime();
+          return tB - tA;
+        });
+
+        const primaryProfile = profileList[0];
+        connectedUserMap.set(dUserId, primaryProfile.id);
+        osUserToDiscordMap.set(primaryProfile.id, dUserId);
+
+        console.warn(`[Reconciliation] Multiple OS profiles (${profileList.length}) connected to Discord ID ${dUserId}. Keeping primary ${primaryProfile.id} and disconnecting duplicates...`);
+        for (let i = 1; i < profileList.length; i++) {
+          const dup = profileList[i];
+          try {
+            await supabase
+              .from('profiles')
+              .update({
+                discord_connected: false,
+                discord_user_id: null,
+                discord_username: null,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', dup.id);
+
+            await supabase
+              .from('discord_links')
+              .update({
+                status: 'unlinked',
+                unlinked_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              })
+              .eq('os_user_id', dup.id)
+              .eq('discord_user_id', dUserId);
+          } catch (rDupErr) {
+            console.warn(`[Reconciliation] Failed to disconnect duplicate profile ${dup.id}:`, rDupErr.message);
+          }
         }
       }
     }
 
-    // Refresh live rosters in 👥 Current Roles for all chapters
-    await refreshAllChapterRosters(client);
-
-    // Check guilds in parallel to ensure no unlinked/unconnected members hold leftover OS roles (Section 5.5)
-    await Promise.all(
-      Array.from(client.guilds.cache.values()).map(async (guild) => {
-        const members = await guild.members.fetch().catch(() => null);
-        if (!members) return;
-        for (const [memId, member] of members) {
-          if (member.user.bot) continue;
-          if (!connectedDiscordIds.has(memId)) {
-            // Check if member holds any OS roles
-            const hasOsRole = member.roles.cache.some((r) => {
-              if (r.managed || r.name === '@everyone' || r.name.toLowerCase() === 'unverified') return false;
-              return (
-                config.mainRoles.allowedRoles.includes(r.name) ||
-                r.name === 'ELEVATES • Founder' ||
-                r.name === 'ELEVATES • Admin' ||
-                r.name === 'Verified Member' ||
-                r.name === 'ELEVATES • Member' ||
-                r.name.toLowerCase() === (config.roles.verified || '').toLowerCase()
-              );
-            });
-            if (hasOsRole) {
-              console.log(`[RealtimeSync] Cleaning up leftover OS roles for unlinked member ${member.user.tag}...`);
-              await api.syncUserAcrossGuilds(client, memId, null, null, 'low').catch(() => {});
-            }
+    if (activeLinks) {
+      for (const l of activeLinks) {
+        if (l.discord_user_id && l.os_user_id) {
+          const existingOsId = connectedUserMap.get(l.discord_user_id);
+          if (!existingOsId) {
+            connectedUserMap.set(l.discord_user_id, l.os_user_id);
+            osUserToDiscordMap.set(l.os_user_id, l.discord_user_id);
+          } else if (existingOsId !== l.os_user_id) {
+            // Discord ID is already linked to another OS profile! Deactivate conflicting link
+            console.warn(`[Reconciliation] discord_links conflict for Discord ID ${l.discord_user_id}: ${l.os_user_id} vs ${existingOsId}. Marking stale link unlinked...`);
+            supabase
+              .from('discord_links')
+              .update({ status: 'unlinked', unlinked_at: new Date().toISOString() })
+              .eq('os_user_id', l.os_user_id)
+              .eq('discord_user_id', l.discord_user_id)
+              .catch(() => {});
           }
         }
-      })
-    );
-  } catch (err) {
-    console.error('[RealtimeSync] Error in reconcileAllConnectedUsers:', err.message);
+      }
+    }
+
+    const connectedDiscordIds = new Set(connectedUserMap.keys());
+    console.log(`[Reconciliation] Reconciling ${connectedUserMap.size} connected user(s)...`);
+
+    // Sync all connected users across guilds in parallel batches of 5
+    const connectedEntries = Array.from(connectedUserMap.entries());
+    const SYNC_BATCH = 5;
+    for (let i = 0; i < connectedEntries.length; i += SYNC_BATCH) {
+      const batch = connectedEntries.slice(i, i + SYNC_BATCH);
+      await Promise.all(
+        batch.map(async ([discordUserId, osUserId]) => {
+          try {
+            await api.syncUserAcrossGuilds(client, discordUserId, osUserId, null, 'low');
+            results.connectedUsersSynced++;
+          } catch (uErr) {
+            console.warn(`[Reconciliation] Failed to sync connected user ${discordUserId}:`, uErr.message);
+          }
+        })
+      );
+    }
+
+    // 4. Reconcile unlinked and disconnected users
+    // A. Fetch both in parallel — they are independent queries
+    const [{ data: unlinkedLinks }, { data: disconnectedProfiles }] = await Promise.all([
+      supabase.from('discord_links').select('os_user_id, discord_user_id').eq('status', 'unlinked'),
+      supabase.from('profiles').select('id, discord_user_id').eq('discord_connected', false).not('discord_user_id', 'is', null),
+    ]);
+
+    const unlinkedDiscordIds = new Set();
+    if (unlinkedLinks) {
+      for (const l of unlinkedLinks) {
+        if (l.discord_user_id && !connectedDiscordIds.has(l.discord_user_id)) {
+          unlinkedDiscordIds.add(l.discord_user_id);
+        }
+      }
+    }
+    if (disconnectedProfiles) {
+      for (const p of disconnectedProfiles) {
+        if (p.discord_user_id && !connectedDiscordIds.has(p.discord_user_id)) {
+          unlinkedDiscordIds.add(p.discord_user_id);
+        }
+      }
+    }
+
+    // Clean unlinked users in parallel batches of 5
+    const unlinkedArr = Array.from(unlinkedDiscordIds);
+    for (let i = 0; i < unlinkedArr.length; i += SYNC_BATCH) {
+      const batch = unlinkedArr.slice(i, i + SYNC_BATCH);
+      await Promise.all(
+        batch.map(async (discordId) => {
+          try {
+            await api.syncUserAcrossGuilds(client, discordId, null, null, 'low');
+            results.unlinkedUsersCleaned++;
+          } catch (cleanErr) {
+            console.warn(`[Reconciliation] Failed to clean unlinked user ${discordId}:`, cleanErr.message);
+          }
+        })
+      );
+    }
+
+    // B. Efficient cache scan: Inspect in-memory guild.members.cache without full API fetch
+    for (const [, guild] of client.guilds.cache) {
+      for (const [memId, member] of guild.members.cache) {
+        if (member.user?.bot) continue;
+        if (!connectedDiscordIds.has(memId) && !unlinkedDiscordIds.has(memId)) {
+          const hasOsRole = member.roles.cache.some((r) => {
+            if (r.managed || r.name === '@everyone' || r.name.toLowerCase() === 'unverified') return false;
+            return (
+              config.mainRoles?.allowedRoles?.includes(r.name) ||
+              r.name === 'ELEVATES • Founder' ||
+              r.name === 'Founder' ||
+              r.name === 'ELEVATES • Admin' ||
+              r.name === 'HQ Admin' ||
+              r.name === 'Admin' ||
+              r.name === 'Executive Member' ||
+              r.name === 'Campus Lead' ||
+              r.name === 'Class Rep' ||
+              r.name === 'Class Representative' ||
+              r.name === 'Student' ||
+              r.name === 'Verified Member' ||
+              r.name === 'ELEVATES • Member' ||
+              r.name.toLowerCase() === (config.roles?.verified || '').toLowerCase()
+            );
+          });
+          if (hasOsRole) {
+            console.log(`[Reconciliation] Found unlinked member with leftover OS roles in cache: ${member.user?.tag || memId}. Cleaning up...`);
+            await api.syncUserAcrossGuilds(client, memId, null, null, 'low').catch(() => {});
+            results.unlinkedUsersCleaned++;
+          }
+        }
+      }
+    }
+
+    // 5. Reconcile active cluster memberships
+    try {
+      const clusterResults = await reconcileAllClusters(client);
+      results.clustersReconciled = Array.isArray(clusterResults) ? clusterResults.length : 0;
+    } catch (cErr) {
+      console.error('[Reconciliation] Error reconciling clusters:', cErr.message);
+    }
+
+    // 6. Refresh live chapter rosters in 👥 Current Roles
+    try {
+      await refreshAllChapterRosters(client);
+    } catch (rostErr) {
+      console.error('[Reconciliation] Error refreshing chapter rosters:', rostErr.message);
+    }
+
+    results.durationMs = Date.now() - startTime;
+    console.log(`[Reconciliation] === Full reconciliation completed in ${results.durationMs}ms ===`);
+    return results;
+  } catch (fatalErr) {
+    console.error('[Reconciliation] Fatal error during full reconciliation:', fatalErr);
+    results.durationMs = Date.now() - startTime;
+    return results;
   }
 }
 
-module.exports = { initRealtimeSync, reconcileAllConnectedUsers, reconcileRecentChanges, refreshAllChapterRosters };
+/**
+ * Backward compatibility alias for runFullReconciliation.
+ */
+async function reconcileAllConnectedUsers(client) {
+  return runFullReconciliation(client);
+}
+
+/**
+ * Starts the recurring periodic reconciliation interval.
+ * Wrapped in try/catch and overlap guard so a single failure (e.g. transient DB timeout)
+ * never kills the recurring schedule.
+ *
+ * @param {import('discord.js').Client} client
+ * @param {number} [intervalMs] Interval in milliseconds (defaults to RECONCILIATION_INTERVAL_MS or 3 minutes)
+ * @returns {NodeJS.Timeout}
+ */
+function startReconciliationInterval(client, intervalMs) {
+  if (reconciliationIntervalTimer) {
+    clearInterval(reconciliationIntervalTimer);
+    reconciliationIntervalTimer = null;
+  }
+
+  const configuredInterval = intervalMs ||
+    (process.env.RECONCILIATION_INTERVAL_MS ? parseInt(process.env.RECONCILIATION_INTERVAL_MS, 10) : 3 * 60 * 1000);
+
+  console.log(`[ReconciliationSupervisor] Starting periodic reconciliation interval every ${configuredInterval / 1000}s (${configuredInterval / 60000}m)...`);
+
+  reconciliationIntervalTimer = setInterval(async () => {
+    if (isReconciliationRunning) {
+      console.warn('[ReconciliationSupervisor] Previous reconciliation pass still in progress. Skipping overlapping interval.');
+      return;
+    }
+
+    isReconciliationRunning = true;
+    try {
+      console.log('[ReconciliationSupervisor] Triggering scheduled periodic reconciliation pass...');
+      await (module.exports.runFullReconciliation || runFullReconciliation)(client);
+      console.log('[ReconciliationSupervisor] Scheduled reconciliation pass completed successfully.');
+    } catch (err) {
+      console.error('[ReconciliationSupervisor] Resilient error handler caught failure during periodic reconciliation run:', err.message || err);
+      // Timer continues running! Next run will execute as scheduled.
+    } finally {
+      isReconciliationRunning = false;
+    }
+  }, configuredInterval);
+
+  if (reconciliationIntervalTimer && typeof reconciliationIntervalTimer.unref === 'function') {
+    reconciliationIntervalTimer.unref();
+  }
+
+  return reconciliationIntervalTimer;
+}
+
+/**
+ * Stops the periodic reconciliation interval.
+ */
+function stopReconciliationInterval() {
+  if (reconciliationIntervalTimer) {
+    clearInterval(reconciliationIntervalTimer);
+    reconciliationIntervalTimer = null;
+    console.log('[ReconciliationSupervisor] Stopped periodic reconciliation interval.');
+  }
+}
+
+/**
+ * Simulates a Realtime disconnect for testing mid-session resilience and gap recovery.
+ *
+ * @param {import('discord.js').Client} client
+ * @param {string} [reason]
+ */
+function simulateDisconnect(client, reason = 'Simulated transport failure (CHANNEL_ERROR)') {
+  isRealtimeSubscribed = false;
+  lastDisconnectedAt = new Date().toISOString();
+  lastDisconnectReason = reason;
+
+  console.warn(
+    `[RealtimeSync] [SIMULATION] Realtime connection disconnect simulated. Reason: ${reason}. ` +
+    `[Disconnect Window] Last known good connection: ${lastKnownGoodConnection || 'N/A'}, Disconnected at: ${lastDisconnectedAt}.`
+  );
+
+  if (activeRealtimeChannel) {
+    try {
+      supabase.removeChannel(activeRealtimeChannel).catch(() => {});
+    } catch (_) {}
+    activeRealtimeChannel = null;
+  }
+
+  if (client) {
+    scheduleReconnect(client);
+  }
+}
+
+/**
+ * Simulates Realtime reconnection for testing gap recovery.
+ *
+ * @param {import('discord.js').Client} client
+ * @returns {Promise<object>}
+ */
+async function simulateReconnect(client) {
+  isRealtimeSubscribed = true;
+  lastReconnectedAt = new Date().toISOString();
+  const outageDurationMs = lastDisconnectedAt
+    ? (new Date(lastReconnectedAt).getTime() - new Date(lastDisconnectedAt).getTime())
+    : 0;
+
+  console.log(
+    `[RealtimeSync] [SIMULATION] Realtime connection RESTORED. ` +
+    `[Disconnect Window] Last known good connection: ${lastKnownGoodConnection || 'N/A'}, ` +
+    `Disconnected at: ${lastDisconnectedAt || 'unknown'}, ` +
+    `Reconnected at: ${lastReconnectedAt} (Outage window: ${outageDurationMs}ms).`
+  );
+
+  const res = await runFullReconciliation(client);
+  lastKnownGoodConnection = lastReconnectedAt;
+  lastDisconnectedAt = null;
+  lastDisconnectReason = null;
+  return res;
+}
+
+/**
+ * Returns current Realtime connection health metrics and timestamps.
+ *
+ * @returns {object}
+ */
+function getConnectionHealth() {
+  return {
+    isSubscribed: isRealtimeSubscribed,
+    isReconnecting,
+    reconnectAttempts,
+    lastKnownGoodConnection,
+    lastDisconnectedAt,
+    lastReconnectedAt,
+    lastDisconnectReason,
+  };
+}
+
+module.exports = {
+  initRealtimeSync,
+  runFullReconciliation,
+  reconcileAllConnectedUsers,
+  resolveAllPendingRoles,
+  startReconciliationInterval,
+  stopReconciliationInterval,
+  simulateDisconnect,
+  simulateReconnect,
+  getConnectionHealth,
+  reconcileRecentChanges,
+  refreshAllChapterRosters,
+  reconcileUnprovisionedClusters,
+  reconcileClustersOnBoot: reconcileUnprovisionedClusters,
+};
 

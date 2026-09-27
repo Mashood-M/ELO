@@ -347,6 +347,13 @@ async function runTests() {
     const mockInteraction = {
       user: { id: 'unlinked_user', tag: 'Unlinked#0001' },
       client,
+      replied: false,
+      deferred: false,
+      deferReply: async () => { mockInteraction.deferred = true; },
+      editReply: async (payload) => {
+        replyPayload = payload;
+        return payload;
+      },
       reply: async (payload) => {
         replyPayload = payload;
         return payload;
@@ -374,6 +381,14 @@ async function runTests() {
     const mockInteraction = {
       user: { id: 'anyone_user', tag: 'Anyone#0001' },
       client,
+      replied: false,
+      deferred: false,
+      deferReply: async () => { mockInteraction.deferred = true; },
+      deferUpdate: async () => { mockInteraction.deferred = true; },
+      editReply: async (payload) => {
+        updatePayload = payload;
+        return payload;
+      },
       update: async (payload) => {
         updatePayload = payload;
       },
@@ -438,6 +453,18 @@ async function runTests() {
     const mockInteraction = {
       user: { id: 'user_alice', tag: 'Alice#0001' },
       client,
+      replied: false,
+      deferred: false,
+      deferReply: async () => { mockInteraction.deferred = true; },
+      deferUpdate: async () => { mockInteraction.deferred = true; },
+      editReply: async (payload) => {
+        replyPayload = payload;
+        return payload;
+      },
+      followUp: async (payload) => {
+        replyPayload = payload;
+        return payload;
+      },
       reply: async (payload) => {
         replyPayload = payload;
       },
@@ -630,6 +657,18 @@ async function runTests() {
     const mockNotYetButtonInteraction = {
       user: { id: 'user_alice' },
       client,
+      replied: false,
+      deferred: false,
+      deferUpdate: async () => { mockNotYetButtonInteraction.deferred = true; },
+      deferReply: async () => { mockNotYetButtonInteraction.deferred = true; },
+      editReply: async (payload) => {
+        updatePayload = payload;
+        return payload;
+      },
+      followUp: async (payload) => {
+        updatePayload = payload;
+        return payload;
+      },
       update: async (payload) => {
         updatePayload = payload;
       },
@@ -744,6 +783,13 @@ async function runTests() {
       user: { id: 'random_user' },
       member: nonStaffMember,
       client,
+      replied: false,
+      deferred: false,
+      deferReply: async () => { mockInteraction.deferred = true; },
+      editReply: async (payload) => {
+        errorReply = payload;
+        return payload;
+      },
       reply: async (payload) => {
         errorReply = payload;
       },
@@ -799,6 +845,14 @@ async function runTests() {
     const mockButtonInteraction = {
       user: { id: 'user_chat_flow', tag: 'ChatUser#0001' },
       client,
+      replied: false,
+      deferred: false,
+      deferReply: async () => { mockButtonInteraction.deferred = true; },
+      deferUpdate: async () => { mockButtonInteraction.deferred = true; },
+      editReply: async (p) => {
+        buttonUpdate = p;
+        return p;
+      },
       update: async (p) => {
         buttonUpdate = p;
       },
@@ -852,6 +906,8 @@ async function runTests() {
     const mockAttachButtonInteraction = {
       user: { id: 'user_alice' },
       client,
+      replied: false,
+      deferred: false,
       showModal: async (m) => {
         modalShown = m;
       },

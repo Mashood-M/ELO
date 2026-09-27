@@ -194,6 +194,9 @@ async function activateCurrentGuild(interaction, inputChapter = null) {
       guildId: guild.id,
     }, 'channel_role_changes').catch(() => {});
 
+    // Resolve link channel from guild cache (provisioned by provisionChapterGuild)
+    const linkChannel = guild.channels.cache.find((c) => c.name === 'link-server');
+
     const successEmbed = new EmbedBuilder()
       .setColor(0x22C55E)
       .setTitle(`🎉 ${targetChapter.name} Discord Server Activated!`)

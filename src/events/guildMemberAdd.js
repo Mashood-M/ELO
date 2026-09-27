@@ -23,6 +23,17 @@ module.exports = {
         // Sync roles and nickname across this guild immediately!
         await api.syncUserAcrossGuilds(member.client, member.id);
 
+        // Also assign any cluster member roles immediately!
+        try {
+          const { handleUserLinked } = require('../lib/clusterSync');
+          await handleUserLinked(member.client, {
+            discord_user_id: member.id,
+            os_user_id: identity.profile.id,
+          });
+        } catch (cErr) {
+          console.warn('[guildMemberAdd] Error syncing cluster roles for member:', cErr.message);
+        }
+
         api.logChapterEvent(member.client, guildConfig?.chapterId, guild.id, 'join_verified', {
           username: member.user.tag,
           discord_user_id: member.id,

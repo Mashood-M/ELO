@@ -34,6 +34,16 @@ async function ensureLinkChannel(guild) {
         (c.name === 'link-server' || c.name === 'welcome' || c.name.includes('verify'))
     );
 
+    // If not found in cache, fetch channels from Discord API and re-check
+    if (!channel && typeof guild.channels?.fetch === 'function') {
+      await guild.channels.fetch().catch(() => {});
+      channel = guild.channels.cache.find(
+        (c) =>
+          c.type === ChannelType.GuildText &&
+          (c.name === 'link-server' || c.name === 'welcome' || c.name.includes('verify'))
+      );
+    }
+
     // If neither exists, attempt to create #link-server
     if (!channel && me.permissions.has(PermissionFlagsBits.ManageChannels)) {
       channel = await guild.channels.create({

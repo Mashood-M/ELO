@@ -7,13 +7,13 @@ class SyncQueue {
   constructor() {
     this.queue = [];
     this.activeWorkers = 0;
-    this.maxConcurrency = 3;
+    this.maxConcurrency = 5; // Increased from 3 for faster parallel Discord API throughput
     this.processing = false;
     this.pendingSet = new Set(); // deduplication for pending tasks
     this.inFlightSet = new Set(); // deduplication for in-flight tasks
     this.rateLimitedUntil = 0;
-    this.minDelayMs = 25; // fast spacing between calls (reduced from 250ms)
-    this.maxRetries = 4;
+    this.minDelayMs = 0; // zero delay between calls for instant execution (sub-second performance)
+    this.maxRetries = 5; // increased from 4 for better transient error resilience
   }
 
   /**
@@ -35,9 +35,10 @@ class SyncQueue {
     }
 
     const key = `${type}:${id}`;
-    if (this.pendingSet.has(key)) {
+    // Deduplicate: skip if already pending OR currently in-flight
+    if (this.pendingSet.has(key) || this.inFlightSet.has(key)) {
       if (resolve) resolve(null);
-      return; // Already pending in queue to execute next
+      return;
     }
 
     this.pendingSet.add(key);

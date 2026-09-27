@@ -911,6 +911,13 @@ async function ensureTicketForum(guild, lane, chapter = null) {
     (c) => c.type === ChannelType.GuildCategory && c.name.toUpperCase() === categoryName.toUpperCase()
   );
 
+  if (!category && typeof guild.channels?.fetch === 'function') {
+    await guild.channels.fetch().catch(() => {});
+    category = guild.channels.cache.find(
+      (c) => c.type === ChannelType.GuildCategory && c.name.toUpperCase() === categoryName.toUpperCase()
+    );
+  }
+
   if (!category) {
     try {
       category = await guild.channels.create({
@@ -927,10 +934,20 @@ async function ensureTicketForum(guild, lane, chapter = null) {
   // 3. Locate or create Forum channel
   let forumChannel = guild.channels.cache.find(
     (c) =>
-      c.name === channelName &&
+      c.name.toLowerCase() === channelName.toLowerCase() &&
       (c.type === ChannelType.GuildForum || c.type === ChannelType.GuildText) &&
       (!category || c.parentId === category.id)
   );
+
+  if (!forumChannel && typeof guild.channels?.fetch === 'function') {
+    await guild.channels.fetch().catch(() => {});
+    forumChannel = guild.channels.cache.find(
+      (c) =>
+        c.name.toLowerCase() === channelName.toLowerCase() &&
+        (c.type === ChannelType.GuildForum || c.type === ChannelType.GuildText) &&
+        (!category || c.parentId === category.id)
+    );
+  }
 
   if (!forumChannel) {
     const topic = `Elevates ${laneDef.displayName} Tickets (${laneDef.description})`;
@@ -1251,17 +1268,19 @@ async function handleLaneButtonClick(interaction, lane) {
   const laneDef = TICKET_LANES[lane];
   if (!laneDef) return;
 
+  // Immediately defer the reply so the 3-second Discord interaction window doesn't expire
+  // while we're doing async DB / API lookups. All subsequent replies use editReply/followUp.
+  if (!interaction.replied && !interaction.deferred) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+
   // 1. Check if user already has an open ticket in this lane
   const existingTicket = await getOpenTicketForUserAndLane(interaction.user.id, lane);
   if (existingTicket) {
     const msg =
       `⚠️ You already have an open ticket in the **${laneDef.displayName}** category.\n` +
       'You can only have one open ticket per lane at a time. Please reply directly in this DM to follow up on your existing ticket.';
-    if (!interaction.replied && !interaction.deferred) {
-      return interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-    } else {
-      return interaction.followUp({ content: msg, flags: MessageFlags.Ephemeral });
-    }
+    return interaction.editReply({ content: msg }).catch(() => {});
   }
 
   // 2. Verification check for Chapter lanes (Executive Team & Campus Lead)
@@ -1280,50 +1299,37 @@ async function handleLaneButtonClick(interaction, lane) {
           `Opening a ticket for **${laneDef.displayName}** routes directly to your local chapter team.\n\n` +
           'Please connect your ElevatesOS account first so we can identify your chapter:\n' +
           '• Run `/connect` in DM or any server\n' +
-          '• Or click **🔗 Connect Account** in your chapter’s `#link-server` channel.'
+          "• Or click **🔗 Connect Account** in your chapter's `#link-server` channel."
         )
         .setFooter({ text: 'ElevatesOS Identity Verification' });
 
-      if (!interaction.replied && !interaction.deferred) {
-        return interaction.reply({ embeds: [linkEmbed], flags: MessageFlags.Ephemeral });
-      } else {
-        return interaction.followUp({ embeds: [linkEmbed], flags: MessageFlags.Ephemeral });
-      }
+      return interaction.editReply({ embeds: [linkEmbed] }).catch(() => {});
     }
 
     const chapterId = identity.chapterId || identity.chapter_id || identity.profile?.chapter_id;
     if (!chapterId) {
-      const msg =
-        '⚠️ Your linked ElevatesOS account is not currently assigned to an active chapter.\n' +
-        'Please join a chapter on ElevatesOS, or contact **Founder** / **Admin** support for help.';
-      if (!interaction.replied && !interaction.deferred) {
-        return interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-      } else {
-        return interaction.followUp({ content: msg, flags: MessageFlags.Ephemeral });
-      }
+      return interaction.editReply({
+        content:
+          '⚠️ Your linked ElevatesOS account is not currently assigned to an active chapter.\n' +
+          'Please join a chapter on ElevatesOS, or contact **Founder** / **Admin** support for help.',
+      }).catch(() => {});
     }
 
     const chapterObj = await api.getChapterByIdentifier(chapterId);
     if (!chapterObj) {
-      const msg = '⚠️ Could not resolve your assigned chapter details. Please contact Admin support.';
-      if (!interaction.replied && !interaction.deferred) {
-        return interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-      } else {
-        return interaction.followUp({ content: msg, flags: MessageFlags.Ephemeral });
-      }
+      return interaction.editReply({
+        content: '⚠️ Could not resolve your assigned chapter details. Please contact Admin support.',
+      }).catch(() => {});
     }
 
     // Verify chapter Discord server is set up
     const chapterGuild = await resolveGuildForLane(interaction.client, lane, chapterObj.id);
     if (!chapterGuild) {
-      const msg =
-        `⚠️ The Discord server for **${chapterObj.name}** has not been provisioned yet.\n` +
-        'Please reach out to **Founder** or **Admin** support for assistance in the meantime.';
-      if (!interaction.replied && !interaction.deferred) {
-        return interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-      } else {
-        return interaction.followUp({ content: msg, flags: MessageFlags.Ephemeral });
-      }
+      return interaction.editReply({
+        content:
+          `⚠️ The Discord server for **${chapterObj.name}** has not been provisioned yet.\n` +
+          'Please reach out to **Founder** or **Admin** support for assistance in the meantime.',
+      }).catch(() => {});
     }
 
     resolvedChapterId = chapterObj.id;
@@ -1336,24 +1342,9 @@ async function handleLaneButtonClick(interaction, lane) {
   pendingInitialAttachments.delete(interaction.user.id);
 
   if (prefillText || initialAttachments.length > 0) {
-    if (typeof interaction.update === 'function') {
-      await interaction.update({
-        content: `✅ **Connecting to ${laneDef.displayName}...**`,
-        components: [],
-        embeds: [],
-      }).catch(async () => {
-        if (!interaction.replied && !interaction.deferred) {
-          await interaction.reply({ content: `✅ **Connecting to ${laneDef.displayName}...**`, flags: MessageFlags.Ephemeral }).catch(() => {});
-        }
-      });
-    } else if (typeof interaction.reply === 'function') {
-      if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({
-          content: `✅ **Connecting to ${laneDef.displayName}...**`,
-          flags: MessageFlags.Ephemeral,
-        }).catch(() => {});
-      }
-    }
+    await interaction.editReply({
+      content: `✅ **Connecting to ${laneDef.displayName}...**`,
+    }).catch(() => {});
 
     return createOrReopenTicket(
       interaction.client,
@@ -1382,25 +1373,7 @@ async function handleLaneButtonClick(interaction, lane) {
     )
     .setFooter({ text: 'Elevates Support • Send your message below' });
 
-  const sendPromptReply = async () => {
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ embeds: [chatPromptEmbed], flags: MessageFlags.Ephemeral }).catch(() => {});
-    } else {
-      await interaction.followUp({ embeds: [chatPromptEmbed], flags: MessageFlags.Ephemeral }).catch(() => {});
-    }
-  };
-
-  if (typeof interaction.update === 'function') {
-    await interaction.update({
-      content: null,
-      embeds: [chatPromptEmbed],
-      components: [],
-    }).catch(async () => {
-      await sendPromptReply();
-    });
-  } else if (typeof interaction.reply === 'function') {
-    await sendPromptReply();
-  }
+  await interaction.editReply({ embeds: [chatPromptEmbed] }).catch(() => {});
 }
 
 /**
@@ -1878,25 +1851,26 @@ async function handleTicketModalSubmit(interaction) {
  * @param {string} ticketId
  */
 async function handleRouteButtonClick(interaction, ticketId) {
+  // Defer immediately before any async DB work to keep the interaction token alive
+  await interaction.deferUpdate().catch(() => {});
+
   const ticket = inMemoryTickets.get(ticketId) || (await getTicketByThreadId(ticketId));
   if (!ticket || ticket.status !== 'open') {
-    return interaction.reply({
+    return interaction.followUp({
       content: '⚠️ That ticket is no longer open.',
       flags: MessageFlags.Ephemeral,
-    });
+    }).catch(() => {});
   }
 
   const pending = pendingDmMessages.get(interaction.user.id);
   pendingDmMessages.delete(interaction.user.id);
 
   if (!pending) {
-    return interaction.reply({
+    return interaction.followUp({
       content: `Active ticket selected: **${getLaneDisplayName(ticket.lane)}**. Please send your message now.`,
       flags: MessageFlags.Ephemeral,
-    });
+    }).catch(() => {});
   }
-
-  await interaction.deferUpdate();
 
   try {
     const thread =
@@ -2115,13 +2089,14 @@ async function handleStaffReply(message) {
  * @param {string} ticketId
  */
 async function handleSolveButtonClick(interaction, ticketId) {
+  // Defer immediately before any async DB lookup to keep the interaction token alive
+  if (!interaction.replied && !interaction.deferred) {
+    await interaction.deferUpdate().catch(() => {});
+  }
+
   const ticket = inMemoryTickets.get(ticketId) || (await getTicketByThreadId(ticketId));
   if (!ticket) {
-    if (!interaction.replied && !interaction.deferred) {
-      return interaction.reply({ content: '⚠️ Ticket not found.', flags: MessageFlags.Ephemeral });
-    } else {
-      return interaction.followUp({ content: '⚠️ Ticket not found.', flags: MessageFlags.Ephemeral });
-    }
+    return interaction.followUp({ content: '⚠️ Ticket not found.', flags: MessageFlags.Ephemeral }).catch(() => {});
   }
 
   const thanksMessage =
@@ -2130,26 +2105,13 @@ async function handleSolveButtonClick(interaction, ticketId) {
 
   // Immediately remove buttons and replace message with the thanks note (no lingering buttons)
   try {
-    if (typeof interaction.update === 'function') {
-      await interaction.update({
-        content: thanksMessage,
-        components: [],
-        embeds: [],
-      });
-    } else if (typeof interaction.editReply === 'function') {
-      await interaction.editReply({
-        content: thanksMessage,
-        components: [],
-        embeds: [],
-      });
-    }
+    await interaction.editReply({
+      content: thanksMessage,
+      components: [],
+      embeds: [],
+    });
   } catch (updateErr) {
     console.warn('[ticketSystem] Could not update interaction message directly:', updateErr.message);
-    try {
-      if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: thanksMessage, flags: MessageFlags.Ephemeral });
-      }
-    } catch (_) {}
   }
 
   // Clean up any tracked solve prompt message for this ticket
@@ -2191,14 +2153,17 @@ async function handleSolveButtonClick(interaction, ticketId) {
  * @param {string} ticketId
  */
 async function handleNotYetButtonClick(interaction, ticketId) {
+  // Defer immediately before any async DB lookup to keep the interaction token alive
+  if (!interaction.replied && !interaction.deferred) {
+    await interaction.deferUpdate().catch(() => {});
+  }
+
   const ticket = inMemoryTickets.get(ticketId) || (await getTicketByThreadId(ticketId));
   if (!ticket || ticket.status !== 'open') {
-    const msg = '⚠️ This ticket is no longer open. Please send a message or run `/ticket` to open a new one.';
-    if (!interaction.replied && !interaction.deferred) {
-      return interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
-    } else {
-      return interaction.followUp({ content: msg, flags: MessageFlags.Ephemeral });
-    }
+    return interaction.followUp({
+      content: '⚠️ This ticket is no longer open. Please send a message or run `/ticket` to open a new one.',
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {});
   }
 
   const embed = new EmbedBuilder()
@@ -2210,25 +2175,11 @@ async function handleNotYetButtonClick(interaction, ticketId) {
     )
     .setFooter({ text: 'Elevates Support • Send your message below' });
 
-  const sendNotYetReply = async () => {
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral }).catch(() => {});
-    } else {
-      await interaction.followUp({ embeds: [embed], flags: MessageFlags.Ephemeral }).catch(() => {});
-    }
-  };
-
-  if (typeof interaction.update === 'function') {
-    await interaction.update({
-      content: null,
-      embeds: [embed],
-      components: [],
-    }).catch(async () => {
-      await sendNotYetReply();
-    });
-  } else if (typeof interaction.reply === 'function') {
-    await sendNotYetReply();
-  }
+  await interaction.editReply({
+    content: null,
+    embeds: [embed],
+    components: [],
+  }).catch(() => {});
 }
 
 
@@ -2240,12 +2191,24 @@ async function handleNotYetButtonClick(interaction, ticketId) {
  * @param {string} ticketId
  */
 async function handleAttachButtonClick(interaction, ticketId) {
-  const ticket = inMemoryTickets.get(ticketId) || (await getTicketByThreadId(ticketId));
+  // NOTE: We cannot deferReply/deferUpdate here because showModal() requires the interaction
+  // to be unacknowledged. Instead we check the in-memory cache first (synchronous) to avoid
+  // an async DB round-trip before the modal is shown. If not cached, we do the lookup.
+  let ticket = inMemoryTickets.get(ticketId);
+  if (!ticket) {
+    ticket = await getTicketByThreadId(ticketId);
+  }
   if (!ticket || ticket.status !== 'open') {
-    return interaction.reply({
+    if (!interaction.replied && !interaction.deferred) {
+      return interaction.reply({
+        content: '⚠️ This ticket is no longer open. Please send a message or run `/ticket` to open a new one.',
+        flags: MessageFlags.Ephemeral,
+      }).catch(() => {});
+    }
+    return interaction.followUp({
       content: '⚠️ This ticket is no longer open. Please send a message or run `/ticket` to open a new one.',
       flags: MessageFlags.Ephemeral,
-    });
+    }).catch(() => {});
   }
 
   const modal = new ModalBuilder()
@@ -2371,12 +2334,17 @@ async function handleAttachModalSubmit(interaction) {
  * @returns {Promise<boolean>}
  */
 async function handleStaffClose(threadChannel, closedBy, interaction = null) {
+  // Defer immediately — the permission checks and DB lookups below take async time
+  // and will exceed the 3-second Discord interaction window without this.
+  if (interaction && !interaction.replied && !interaction.deferred) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+
   if (!threadChannel || !threadChannel.isThread()) {
     if (interaction) {
-      await interaction.reply({
+      await interaction.editReply({
         content: '⚠️ This command can only be used inside an active ticket thread.',
-        flags: MessageFlags.Ephemeral,
-      });
+      }).catch(() => {});
     }
     return false;
   }
@@ -2384,10 +2352,9 @@ async function handleStaffClose(threadChannel, closedBy, interaction = null) {
   const ticket = await getTicketByThreadId(threadChannel.id);
   if (!ticket) {
     if (interaction) {
-      await interaction.reply({
+      await interaction.editReply({
         content: '⚠️ This thread is not recognized as an active ticket.',
-        flags: MessageFlags.Ephemeral,
-      });
+      }).catch(() => {});
     }
     return false;
   }
@@ -2406,7 +2373,7 @@ async function handleStaffClose(threadChannel, closedBy, interaction = null) {
   if (!isAuthorized) {
     const errorMsg = `⚠️ Only authorized ${getLaneDisplayName(ticket.lane)} staff can close this ticket.`;
     if (interaction) {
-      await interaction.reply({ content: errorMsg, flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ content: errorMsg }).catch(() => {});
     } else {
       await threadChannel.send(errorMsg);
     }
@@ -2414,15 +2381,10 @@ async function handleStaffClose(threadChannel, closedBy, interaction = null) {
   }
 
   if (ticket.status === 'closed') {
-    const msg = '⚠️ This ticket is already marked as closed.';
     if (interaction) {
-      await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ content: '⚠️ This ticket is already marked as closed.' }).catch(() => {});
     }
     return false;
-  }
-
-  if (interaction) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
   }
 
   try {

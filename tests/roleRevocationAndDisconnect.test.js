@@ -87,6 +87,10 @@ supabase.from = function (table) {
       filters.push((row) => row[col] === val);
       return chain;
     },
+    is: (col, val) => {
+      filters.push((row) => (val === null ? row[col] === null || row[col] === undefined : row[col] === val));
+      return chain;
+    },
     ilike: (col, val) => {
       const cleanVal = String(val).replace(/%/g, '').toLowerCase();
       filters.push((row) => String(row[col] || '').toLowerCase().includes(cleanVal));

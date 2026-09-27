@@ -99,12 +99,24 @@ The bot features a complete, resilient synchronization engine between Supabase a
   - `error_message` (TEXT nullable): Error details if operation failed.
   - `created_at` (TIMESTAMPTZ): Audit timestamp.
 
-#### Dynamic Placement by `access_mode`
-- **`access_mode = 'open'`**:
-  - The private category, `<Cluster Name> Member` role, and child channels are created in the **Elevates Main Server** (confirmed via `guild_config` where `guild_type = 'main'`, fallback `MAIN_GUILD_ID`).
-- **`access_mode = 'invite'` (or closed)**:
-  - Created in the specific **Chapter Server** that `clusters.chapter_id` maps to.
-- Both paths reuse the exact same creation sequence: role creation with immediate ID write-back, category with permission overwrites, child channels, and `discord_category_id` write-back.
+#### Dynamic Placement & Visibility by `access_mode`
+- **`access_mode = 'open'` (or clusters created by Admin/Founder in OS without chapter scoping)**:
+  - Created in the **Elevates Main Server** (confirmed via `guild_config` where `guild_type = 'main'`, fallback `MAIN_GUILD_ID`).
+  - **Open Visibility**: The category is configured to be visible server-wide to all verified members (`Verified Member`, `Executive Member`, `Founder`, `HQ Admin`) while keeping `@everyone` denied so unverified users verify first.
+  - Automatically posts an introductory welcome embed into `#announcements` and assigns the creator and leader their cluster host/member roles.
+- **`access_mode = 'invite'` (or chapter-scoped / private clusters)**:
+  - Created in the specific **Chapter Server** that `clusters.chapter_id` maps to with strict category-level privacy overwrites:
+    - **`@everyone`**: Explicitly **DENIED** `ViewChannel`.
+    - **`Verified Member` (and equivalents `ELEVATES • Member`, `Member`)**: Explicitly **DENIED** `ViewChannel` (prevents broader server-wide verified allows from granting unintentional access).
+    - **Cluster Member role (`<Name> Member`)**: Explicitly **ALLOWED** `ViewChannel`, `SendMessages`, `Connect`.
+    - **Cluster Host role (`<Name> Host`)**: Explicitly **ALLOWED** `ViewChannel`, `SendMessages`, `Connect`, `ManageMessages` (pinning & deletion), `ManageThreads`, and voice management (`MuteMembers`, `DeafenMembers`, `MoveMembers`).
+    - **Campus Lead role**: Explicitly **ALLOWED** `ViewChannel`, `ManageChannels`, `ManageRoles`, `SendMessages`, `Connect` (per chapter oversight rule).
+    - **Executive Member role**: **No blanket access** by default (Executive Members only access clusters they are specifically added to as Member or Host).
+    - **Class Rep & Student roles**: **No blanket access** (unless individually added as Member or Host).
+    - **Founder & HQ Admin roles**: Explicitly **ALLOWED** `ViewChannel`, `ManageChannels`, `ManageRoles`, `SendMessages`, `Connect` (administrative oversight).
+    - **Bot's own role**: Explicitly **ALLOWED** `ViewChannel`, `ManageChannels`, `ManageRoles`, `SendMessages`, `Connect`.
+- Both paths reuse the standard creation sequence: role creation with immediate ID write-back, category with permission overwrites, child channels (`#announcements`, `#discussion`, `#resources`, `#challenges`, `#projects`, `cluster-room` Voice, `cluster-room 1` Voice) locked to parent category permissions via `lockPermissions()`, and `discord_category_id` write-back.
+- **Retroactive Permission Healing**: `reconcileClusterCategoryPermissions` re-evaluates and re-applies these secure category overwrites and re-locks all child channels across every existing active cluster on each startup and periodic reconciliation run.
 
 #### Membership Sync via Array Diffing (`clusters.member_ids`)
 There is no separate `cluster_members` join table — membership lives as `clusters.member_ids UUID[]` directly on the `clusters` row. The bot monitors `clusters` UPDATE events in Supabase Realtime (with `REPLICA IDENTITY FULL` enabled):
@@ -177,14 +189,35 @@ node scripts/reconcile-clusters.js --dry-run
 
 Programmatic execution is also available via `clusterSync`:
 ```javascript
-const { reconcileClusterMembers, reconcileAllClusters } = require('./src/lib/clusterSync');
+const { reconcileClusterMembers, reconcileAllClusters, reconcileUnprovisionedClusters } = require('./src/lib/clusterSync');
 
 // Reconcile single cluster
 await reconcileClusterMembers(client, clusterId);
 
 // Reconcile all active clusters
 await reconcileAllClusters(client);
+
+// Reconcile unprovisioned clusters on startup
+await reconcileUnprovisionedClusters(client);
 ```
+
+#### Startup Cluster Reconciliation & Self-Healing Reconciliation Engine
+To prevent clusters created while the bot was offline (or interrupted partway through creation) from being silently lost, and to self-heal any drift caused by intermittent WebSocket disconnects ("CHANNEL_ERROR ... transport failure"):
+- **Comprehensive Coverage**:
+  - **Unprovisioned Clusters**: Reconciles clusters where `discord_category_id IS NULL` using live INSERT creation logic (roles, category, child channels, initial permissions).
+  - **Bidirectional User Role Sync**: Reconciles users whose current OS-linked state doesn't match actual Discord roles across both Main and Chapter servers (grants missing roles, revokes disqualified/revoked roles, and de-provisions unlinked members by removing OS/verified roles and assigning Unverified).
+  - **Resolvable Pending Roles**: Evaluates rows in `pending_discord_roles` and applies roles for users who are now linked and in-guild, cleaning up resolved rows.
+  - **Chapter Live Rosters**: Refreshes dynamic `👥 Current Roles` topics across chapters.
+- **Recurring Self-Healing Interval**:
+  - Runs standalone at startup AND on a recurring schedule (default 3 minutes, configurable via `RECONCILIATION_INTERVAL_MS`).
+  - Resilient design: protected with try/catch and overlap guards (`isReconciliationRunning`) so transient Supabase timeouts never kill the recurring schedule.
+- **Realtime Disconnect & Outage Window Logging**:
+  - Explicitly logs connection errors/disconnects with timestamps for `lastKnownGoodConnection` vs `lastDisconnectedAt` and disconnect reason.
+  - Upon reconnection, logs the restore event with the exact outage window duration and immediately triggers `runFullReconciliation(client)` to heal any missed gap events.
+- **Scale Efficiency**:
+  - Avoids full `guild.members.fetch()` across all guilds on routine interval runs.
+  - Compares against Supabase state first (`profiles`, `discord_links`, `pending_discord_roles`, `clusters`) and in-memory cache, touching Discord API mutation endpoints only when an actual correction is needed.
+
 
 ### 6. Cluster Weekly Tasks Engine
 - **Supabase Tables (`20260919000000_cluster_tasks.sql`)**:

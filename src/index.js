@@ -1,15 +1,19 @@
 const dns = require('dns');
-dns.setDefaultResultOrder('ipv4first');
+const net = require('net');
 
-// Configure global undici dispatcher to handle connect timeouts gracefully
+dns.setDefaultResultOrder('ipv4first');
+if (typeof net.setDefaultAutoSelectFamily === 'function') {
+  net.setDefaultAutoSelectFamily(false);
+}
+
+// Configure global undici dispatcher to handle connect timeouts gracefully and enforce IPv4
 try {
   const { setGlobalDispatcher, Agent } = require('undici');
   setGlobalDispatcher(
     new Agent({
       connect: {
         timeout: 30000,
-        autoSelectFamily: true,
-        autoSelectFamilyAttemptTimeout: 250,
+        autoSelectFamily: false, // Explicitly disable dual-stack happy eyeballs to avoid EHOSTUNREACH on IPv6 NAT64
       },
     })
   );
@@ -17,17 +21,34 @@ try {
 
 // Process-level handlers to keep bot resilient against transient network timeouts
 process.on('unhandledRejection', (reason) => {
-  console.warn('[Global] Unhandled Rejection:', reason?.message || reason);
+  const isTransientNetworkError =
+    reason?.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    reason?.code === 'ETIMEDOUT' ||
+    reason?.code === 'ECONNRESET' ||
+    reason?.code === 'EHOSTUNREACH' ||
+    reason?.message?.includes('ETIMEDOUT') ||
+    reason?.message?.includes('Connect Timeout Error') ||
+    (reason instanceof AggregateError && reason.errors?.some((e) => e?.code === 'ETIMEDOUT' || e?.code === 'EHOSTUNREACH'));
+
+  if (isTransientNetworkError) {
+    console.warn('[Global] Suppressed transient network connect timeout rejection:', reason?.message || reason?.code || 'ETIMEDOUT');
+    return;
+  }
+  console.warn('[Global] Unhandled Rejection:', reason?.stack || reason?.message || reason);
 });
 
 process.on('uncaughtException', (err) => {
-  if (
+  const isTransientNetworkError =
     err?.code === 'UND_ERR_CONNECT_TIMEOUT' ||
     err?.code === 'ETIMEDOUT' ||
     err?.code === 'ECONNRESET' ||
-    err?.message?.includes('Connect Timeout Error')
-  ) {
-    console.warn('[Global] Suppressed transient network connect timeout:', err.message);
+    err?.code === 'EHOSTUNREACH' ||
+    err?.message?.includes('ETIMEDOUT') ||
+    err?.message?.includes('Connect Timeout Error') ||
+    (err instanceof AggregateError && err.errors?.some((e) => e?.code === 'ETIMEDOUT' || e?.code === 'EHOSTUNREACH'));
+
+  if (isTransientNetworkError) {
+    console.warn('[Global] Suppressed transient network connect timeout:', err?.message || err?.code || 'ETIMEDOUT');
     return;
   }
   console.error('[Global] Uncaught Exception:', err);
@@ -89,11 +110,19 @@ const client = new Client({
   },
 });
 
-// Load commands
+// Load commands — deduplicated by name (first file wins; warns on collision)
 client.commands = new Collection();
 const commandsPath = path.join(__dirname, 'commands');
 for (const file of fs.readdirSync(commandsPath).filter((f) => f.endsWith('.js'))) {
   const command = require(path.join(commandsPath, file));
+  if (!command.data || typeof command.execute !== 'function') {
+    console.warn(`[Startup] Skipping ${file}: missing 'data' or 'execute'.`);
+    continue;
+  }
+  if (client.commands.has(command.data.name)) {
+    console.warn(`[Startup] Duplicate command name "${command.data.name}" in ${file} — skipping.`);
+    continue;
+  }
   client.commands.set(command.data.name, command);
 }
 
@@ -125,4 +154,23 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
-client.login(config.token);
+// Resilient login with automatic retry on transient network failures
+async function startBot(maxRetries = 10, retryDelayMs = 5000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[Startup] Connecting to Discord Gateway (attempt ${attempt}/${maxRetries})...`);
+      await client.login(config.token);
+      return;
+    } catch (err) {
+      console.error(`[Startup] Discord connection failed (attempt ${attempt}/${maxRetries}):`, err?.message || err?.code || err);
+      if (attempt === maxRetries) {
+        console.error('[Startup] Maximum login attempts reached. Check internet connection and Discord bot token.');
+        process.exit(1);
+      }
+      console.log(`[Startup] Retrying Discord connection in ${retryDelayMs / 1000} seconds...`);
+      await new Promise((res) => setTimeout(res, retryDelayMs));
+    }
+  }
+}
+
+startBot();
