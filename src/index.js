@@ -19,18 +19,21 @@ try {
   );
 } catch (_) {}
 
+function isTransientNetworkError(err) {
+  return (
+    err?.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    err?.code === 'ETIMEDOUT' ||
+    err?.code === 'ECONNRESET' ||
+    err?.code === 'EHOSTUNREACH' ||
+    err?.message?.includes('ETIMEDOUT') ||
+    err?.message?.includes('Connect Timeout Error') ||
+    (err instanceof AggregateError && err.errors?.some((e) => e?.code === 'ETIMEDOUT' || e?.code === 'EHOSTUNREACH'))
+  );
+}
+
 // Process-level handlers to keep bot resilient against transient network timeouts
 process.on('unhandledRejection', (reason) => {
-  const isTransientNetworkError =
-    reason?.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-    reason?.code === 'ETIMEDOUT' ||
-    reason?.code === 'ECONNRESET' ||
-    reason?.code === 'EHOSTUNREACH' ||
-    reason?.message?.includes('ETIMEDOUT') ||
-    reason?.message?.includes('Connect Timeout Error') ||
-    (reason instanceof AggregateError && reason.errors?.some((e) => e?.code === 'ETIMEDOUT' || e?.code === 'EHOSTUNREACH'));
-
-  if (isTransientNetworkError) {
+  if (isTransientNetworkError(reason)) {
     console.warn('[Global] Suppressed transient network connect timeout rejection:', reason?.message || reason?.code || 'ETIMEDOUT');
     return;
   }
@@ -38,16 +41,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 process.on('uncaughtException', (err) => {
-  const isTransientNetworkError =
-    err?.code === 'UND_ERR_CONNECT_TIMEOUT' ||
-    err?.code === 'ETIMEDOUT' ||
-    err?.code === 'ECONNRESET' ||
-    err?.code === 'EHOSTUNREACH' ||
-    err?.message?.includes('ETIMEDOUT') ||
-    err?.message?.includes('Connect Timeout Error') ||
-    (err instanceof AggregateError && err.errors?.some((e) => e?.code === 'ETIMEDOUT' || e?.code === 'EHOSTUNREACH'));
-
-  if (isTransientNetworkError) {
+  if (isTransientNetworkError(err)) {
     console.warn('[Global] Suppressed transient network connect timeout:', err?.message || err?.code || 'ETIMEDOUT');
     return;
   }

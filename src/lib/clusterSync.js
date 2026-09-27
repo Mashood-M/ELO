@@ -109,9 +109,23 @@ function invalidateUserToDiscordCache(userId) {
   userToDiscordCache.delete(String(userId).trim());
 }
 
+// Periodic cleanup of expired cluster caches to prevent memory leaks over uptime
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of clusterCache.entries()) {
+    if (v.expiresAt && v.expiresAt < now) clusterCache.delete(k);
+  }
+  for (const [k, v] of userToDiscordCache.entries()) {
+    if (v.expiresAt && v.expiresAt < now) userToDiscordCache.delete(k);
+  }
+  for (const [k, v] of chapterGuildCache.entries()) {
+    if (v.expiresAt && v.expiresAt < now) chapterGuildCache.delete(k);
+  }
+}, 10 * 60 * 1000).unref();
+
 /**
  * Resolves the Discord User ID for a given Supabase User UUID (profiles.id).
- * Checks in-memory cache first, then discord_links and profiles tables.
+ * Checks in-memory cache first, then discord_links and profiles tables in parallel.
  */
 async function resolveDiscordIdForUser(userId) {
   if (!userId) return null;
@@ -129,31 +143,27 @@ async function resolveDiscordIdForUser(userId) {
   }
 
   try {
-    // 1. Primary check in discord_links
-    const { data: link } = await supabase
-      .from('discord_links')
-      .select('discord_user_id')
-      .eq('os_user_id', userId)
-      .eq('status', 'linked')
-      .order('linked_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    // Query discord_links and profiles in parallel
+    const [{ data: link }, { data: profile }] = await Promise.all([
+      supabase
+        .from('discord_links')
+        .select('discord_user_id')
+        .eq('os_user_id', userId)
+        .eq('status', 'linked')
+        .order('linked_at', { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+      supabase
+        .from('profiles')
+        .select('discord_user_id, discord_connected')
+        .eq('id', userId)
+        .maybeSingle(),
+    ]);
 
-    if (link?.discord_user_id) {
-      setUserToDiscordCache(trimmed, link.discord_user_id);
-      return link.discord_user_id;
-    }
-
-    // 2. Secondary check in profiles
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('discord_user_id, discord_connected')
-      .eq('id', userId)
-      .maybeSingle();
-
-    if (profile?.discord_user_id) {
-      setUserToDiscordCache(trimmed, profile.discord_user_id);
-      return profile.discord_user_id;
+    const discordId = link?.discord_user_id || profile?.discord_user_id || null;
+    if (discordId) {
+      setUserToDiscordCache(trimmed, discordId);
+      return discordId;
     }
   } catch (err) {
     console.warn(`[clusterSync] Error resolving Discord ID for user ${userId}:`, err.message);
@@ -201,22 +211,24 @@ async function getChapterGuild(client, chapterId) {
 async function isUserHqOrAdmin(userId) {
   if (!userId) return false;
   try {
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('role, designation')
-      .eq('id', userId)
-      .maybeSingle();
+    const [{ data: profile }, { data: userRoles }] = await Promise.all([
+      supabase
+        .from('profiles')
+        .select('role, designation')
+        .eq('id', userId)
+        .maybeSingle(),
+      supabase
+        .from('user_roles')
+        .select('role_key, role, roles(name, key)')
+        .eq('user_id', userId),
+    ]);
+
     const pRole = (profile?.role || '').toLowerCase().trim();
     const pDes = (profile?.designation || '').toLowerCase().trim();
     if (['founder', 'elevates • founder', 'hq_admin', 'hq admin', 'admin', 'elevates • admin'].includes(pRole) ||
         ['founder', 'elevates • founder', 'hq_admin', 'hq admin', 'admin', 'elevates • admin'].includes(pDes)) {
       return true;
     }
-
-    const { data: userRoles } = await supabase
-      .from('user_roles')
-      .select('role_key, role, roles(name, key)')
-      .eq('user_id', userId);
 
     if (userRoles && Array.isArray(userRoles)) {
       for (const ur of userRoles) {
@@ -239,11 +251,17 @@ async function isUserHqOrAdmin(userId) {
 async function getCreatorChapterInfo(userId) {
   if (!userId) return { chapterId: null, isChapterLead: false };
   try {
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('chapter_id, role')
-      .eq('id', userId)
-      .maybeSingle();
+    const [{ data: profile }, { data: userRoles }] = await Promise.all([
+      supabase
+        .from('profiles')
+        .select('chapter_id, role')
+        .eq('id', userId)
+        .maybeSingle(),
+      supabase
+        .from('user_roles')
+        .select('role_key, role, chapter_id')
+        .eq('user_id', userId),
+    ]);
 
     const pRole = (profile?.role || '').toLowerCase().trim();
     let isChapterLead = [
@@ -252,11 +270,6 @@ async function getCreatorChapterInfo(userId) {
       'exec_member', 'exec member', 'executive',
     ].includes(pRole);
     let chapterId = profile?.chapter_id || null;
-
-    const { data: userRoles } = await supabase
-      .from('user_roles')
-      .select('role_key, role, chapter_id')
-      .eq('user_id', userId);
 
     if (userRoles) {
       for (const ur of userRoles) {
@@ -328,12 +341,8 @@ async function isGuildMainServer(guild) {
   if (!guild) return false;
   if (guild.id === config.mainGuildId) return true;
   try {
-    const { data: gConf } = await supabase
-      .from('guild_config')
-      .select('guild_type')
-      .eq('guild_id', guild.id)
-      .maybeSingle();
-    if (gConf?.guild_type === 'main') return true;
+    const gConf = await api.getGuildConfig(guild.id);
+    if (gConf?.guildType === 'main' || gConf?.guild_type === 'main') return true;
   } catch (_) {}
   return false;
 }
@@ -1474,32 +1483,30 @@ async function handleMemberRemoved(client, memberRow) {
   if (!clusterId || !userId) return;
 
   try {
-    // 3. CRITICAL: always DELETE matching pending_discord_roles row
-    // Prevents bug where someone removed from a cluster before ever linking Discord still gets the role retroactively
-    await supabase
-      .from('pending_discord_roles')
-      .delete()
-      .eq('user_id', userId)
-      .eq('target_id', clusterId);
-
-    // 1. Look up discord_id via identity table
-    const discordUserId = await resolveDiscordIdForUser(userId);
-
-    let cluster = null;
-    const cachedCl = clusterCache.get(clusterId);
-    if (cachedCl && Date.now() < cachedCl.expiresAt) {
-      cluster = cachedCl.data;
-    } else {
-      const { data: fetched } = await supabase
-        .from('clusters')
-        .select('*')
-        .eq('id', clusterId)
-        .maybeSingle();
-      cluster = fetched;
-      if (fetched) {
-        clusterCache.set(clusterId, { data: fetched, expiresAt: Date.now() + 60000 });
-      }
-    }
+    // Run pending_discord_roles deletion, discordId resolution, and cluster resolution in parallel
+    const [, discordUserId, cluster] = await Promise.all([
+      supabase
+        .from('pending_discord_roles')
+        .delete()
+        .eq('user_id', userId)
+        .eq('target_id', clusterId),
+      resolveDiscordIdForUser(userId),
+      (async () => {
+        const cachedCl = clusterCache.get(clusterId);
+        if (cachedCl && Date.now() < cachedCl.expiresAt) {
+          return cachedCl.data;
+        }
+        const { data: fetched } = await supabase
+          .from('clusters')
+          .select('*')
+          .eq('id', clusterId)
+          .maybeSingle();
+        if (fetched) {
+          clusterCache.set(clusterId, { data: fetched, expiresAt: Date.now() + 60000 });
+        }
+        return fetched;
+      })(),
+    ]);
 
     let roleRevoked = false;
 

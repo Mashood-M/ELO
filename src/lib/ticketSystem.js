@@ -157,18 +157,56 @@ function loadLocalStore() {
   }
 }
 
+// Periodic cleanup of stale pending ticket state to prevent memory leaks
+setInterval(() => {
+  const cutoff = Date.now() - 30 * 60 * 1000; // 30 minutes TTL
+  for (const [uid, item] of pendingDmMessages.entries()) {
+    if (item.createdAt && item.createdAt < cutoff) pendingDmMessages.delete(uid);
+  }
+  for (const [uid, item] of pendingLaneSelections.entries()) {
+    if (item.timestamp && item.timestamp < cutoff) pendingLaneSelections.delete(uid);
+  }
+}, 10 * 60 * 1000).unref();
+
+let saveLocalStoreTimer = null;
+
 /**
- * Saves current ticket records to local disk.
+ * Saves current ticket records to local disk asynchronously with debouncing to prevent event loop blocking.
  */
-function saveLocalStore() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
+function saveLocalStore(immediate = false) {
+  if (immediate) {
+    if (saveLocalStoreTimer) {
+      clearTimeout(saveLocalStoreTimer);
+      saveLocalStoreTimer = null;
     }
-    const obj = Object.fromEntries(inMemoryTickets.entries());
-    fs.writeFileSync(DATA_FILE, JSON.stringify(obj, null, 2), 'utf8');
-  } catch (err) {
-    console.warn('[ticketSystem] Could not save local tickets store:', err.message);
+    try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+      const obj = Object.fromEntries(inMemoryTickets.entries());
+      fs.writeFileSync(DATA_FILE, JSON.stringify(obj, null, 2), 'utf8');
+    } catch (err) {
+      console.warn('[ticketSystem] Could not save local tickets store:', err.message);
+    }
+    return;
+  }
+
+  if (!saveLocalStoreTimer) {
+    saveLocalStoreTimer = setTimeout(() => {
+      saveLocalStoreTimer = null;
+      try {
+        if (!fs.existsSync(DATA_DIR)) {
+          fs.mkdirSync(DATA_DIR, { recursive: true });
+        }
+        const obj = Object.fromEntries(inMemoryTickets.entries());
+        fs.promises.writeFile(DATA_FILE, JSON.stringify(obj, null, 2), 'utf8').catch((err) => {
+          console.warn('[ticketSystem] Async save tickets store error:', err.message);
+        });
+      } catch (err) {
+        console.warn('[ticketSystem] Could not save local tickets store:', err.message);
+      }
+    }, 200);
+    if (saveLocalStoreTimer.unref) saveLocalStoreTimer.unref();
   }
 }
 
@@ -758,9 +796,11 @@ async function ensureTicketForum(guild, lane, chapter = null) {
     if (existing) return existing;
   }
 
-  // Make sure channels and roles caches are refreshed
-  await guild.channels.fetch().catch(() => {});
-  await guild.roles.fetch().catch(() => {});
+  // Make sure channels and roles caches are refreshed in parallel
+  await Promise.all([
+    guild.channels.fetch().catch(() => {}),
+    guild.roles.fetch().catch(() => {}),
+  ]);
 
   const categoryName = laneDef.categoryName;
   const channelName = laneDef.forumChannelName;

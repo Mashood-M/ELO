@@ -2,6 +2,8 @@ const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, ChannelType, Mes
 const api = require('../lib/api');
 const supabase = require('../lib/supabase');
 const config = require('../config');
+const { syncChapterClusters } = require('../lib/clusterSync');
+const ticketSystem = require('../lib/ticketSystem');
 
 /**
  * Resolves caller identity and determines the target chapter.
@@ -168,13 +170,11 @@ async function activateCurrentGuild(interaction, inputChapter = null) {
     );
 
     // Sync clusters
-    const { syncChapterClusters } = require('../lib/clusterSync');
     syncChapterClusters(interaction.client, targetChapter.id).catch((err) =>
       console.error('[chapter] Cluster sync error:', err.message)
     );
 
     // Provision Chapter Ticket Forums (Executive Member & Campus Lead)
-    const ticketSystem = require('../lib/ticketSystem');
     ticketSystem.ensureTicketForum(guild, 'campus_lead', targetChapter).catch((err) =>
       console.warn('[chapter] Error ensuring campus lead ticket forum:', err.message)
     );
@@ -265,23 +265,27 @@ module.exports = {
 
     // RULE: One chapter server per Campus Lead
     try {
-      const { data: directLeadConfigs } = await supabase
-        .from('guild_config')
-        .select('guild_id, chapter_id')
-        .or(`campus_lead_id.eq.${profile.id},campus_lead_discord_id.eq.${interaction.user.id}`)
-        .neq('chapter_id', chapterId)
-        .limit(1);
+      const [
+        { data: directLeadConfigs },
+        { data: leadChapters },
+      ] = await Promise.all([
+        supabase
+          .from('guild_config')
+          .select('guild_id, chapter_id')
+          .or(`campus_lead_id.eq.${profile.id},campus_lead_discord_id.eq.${interaction.user.id}`)
+          .neq('chapter_id', chapterId)
+          .limit(1),
+        supabase
+          .from('chapters')
+          .select('id')
+          .eq('campus_lead_id', profile.id),
+      ]);
 
       if (directLeadConfigs && directLeadConfigs.length > 0) {
         return interaction.editReply({
           content: "You've already set up a chapter server. Each Campus Lead can create one chapter server only.",
         });
       }
-
-      const { data: leadChapters } = await supabase
-        .from('chapters')
-        .select('id')
-        .eq('campus_lead_id', profile.id);
 
       if (leadChapters && leadChapters.length > 0) {
         const otherChapterIds = leadChapters.map((c) => c.id).filter((id) => id !== chapterId);

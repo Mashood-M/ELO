@@ -163,14 +163,36 @@ async function handleLinkServerMessage(message) {
 
     const osUserId = codeRow.user_id || codeRow.os_user_id;
 
-    // --- ENFORCE STRICT 1:1 ACCOUNT CONNECTION ---
-    // Check 1: Is this Discord account already connected to a different ElevatesOS profile?
-    const { data: existingProfilesForDiscord } = await supabase
-      .from('profiles')
-      .select('id, full_name, elevates_id, discord_user_id, discord_connected')
-      .eq('discord_user_id', discordUserId)
-      .eq('discord_connected', true);
+    // --- ENFORCE STRICT 1:1 ACCOUNT CONNECTION (Parallel validation queries) ---
+    const [
+      { data: existingProfilesForDiscord },
+      { data: existingLinksForDiscord },
+      { data: currentOsProfile },
+      { data: currentOsLinks },
+    ] = await Promise.all([
+      supabase
+        .from('profiles')
+        .select('id, full_name, elevates_id, discord_user_id, discord_connected')
+        .eq('discord_user_id', discordUserId)
+        .eq('discord_connected', true),
+      supabase
+        .from('discord_links')
+        .select('os_user_id, status')
+        .eq('discord_user_id', discordUserId)
+        .eq('status', 'linked'),
+      supabase
+        .from('profiles')
+        .select('id, discord_user_id, discord_connected, full_name')
+        .eq('id', osUserId)
+        .maybeSingle(),
+      supabase
+        .from('discord_links')
+        .select('discord_user_id, status')
+        .eq('os_user_id', osUserId)
+        .eq('status', 'linked'),
+    ]);
 
+    // Check 1: Is this Discord account already connected to a different ElevatesOS profile?
     const otherProfile = existingProfilesForDiscord?.find((p) => p.id !== osUserId);
     if (otherProfile) {
       console.warn(`[codeVerification] Rejected 1:N link attempt: Discord account ${discordUserId} is already connected to OS user ${otherProfile.id} (${otherProfile.full_name || 'Member'})`);
@@ -180,12 +202,6 @@ async function handleLinkServerMessage(message) {
       if (errorMsg) setTimeout(() => errorMsg.delete().catch(() => {}), 8000);
       return true;
     }
-
-    const { data: existingLinksForDiscord } = await supabase
-      .from('discord_links')
-      .select('os_user_id, status')
-      .eq('discord_user_id', discordUserId)
-      .eq('status', 'linked');
 
     const otherLink = existingLinksForDiscord?.find((l) => l.os_user_id && l.os_user_id !== osUserId);
     if (otherLink) {
@@ -198,12 +214,6 @@ async function handleLinkServerMessage(message) {
     }
 
     // Check 2: Is this ElevatesOS account already connected to a different Discord account?
-    const { data: currentOsProfile } = await supabase
-      .from('profiles')
-      .select('id, discord_user_id, discord_connected, full_name')
-      .eq('id', osUserId)
-      .maybeSingle();
-
     if (
       currentOsProfile?.discord_connected &&
       currentOsProfile.discord_user_id &&
@@ -216,12 +226,6 @@ async function handleLinkServerMessage(message) {
       if (errorMsg) setTimeout(() => errorMsg.delete().catch(() => {}), 8000);
       return true;
     }
-
-    const { data: currentOsLinks } = await supabase
-      .from('discord_links')
-      .select('discord_user_id, status')
-      .eq('os_user_id', osUserId)
-      .eq('status', 'linked');
 
     const otherDiscordLink = currentOsLinks?.find((l) => l.discord_user_id && l.discord_user_id !== discordUserId);
     if (otherDiscordLink) {

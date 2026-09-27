@@ -1309,7 +1309,7 @@ module.exports = {
           await campusLeadMember.roles.remove(unverifiedRole);
         }
         // Set nickname to OS full name if available
-        const identity = await this.getIdentityByDiscordId(campusLeadMember.id);
+        const identity = leadIdentity || (await this.getIdentityByDiscordId(campusLeadMember.id));
         if (identity?.name) {
           await campusLeadMember.setNickname(identity.name).catch(() => {});
         }
@@ -3149,8 +3149,13 @@ module.exports = {
             return found;
           };
 
+          let cachedBotMember = guild.members?.me || null;
+          if (!cachedBotMember && guild.members?.fetchMe) {
+            cachedBotMember = await guild.members.fetchMe().catch(() => null);
+          }
+
           const safeAddChapterRole = async (targetMember, targetRole, g, reason) => {
-            const botMember = g.members?.me || (g.members?.fetchMe ? await g.members.fetchMe().catch(() => null) : null);
+            const botMember = g.members?.me || cachedBotMember;
             const botHighest = botMember?.roles?.highest;
 
             if (botHighest && targetRole.position !== undefined && botHighest.position !== undefined && targetRole.position >= botHighest.position) {
@@ -3177,7 +3182,7 @@ module.exports = {
           };
 
           const safeRemoveChapterRole = async (targetMember, targetRole, g, reason) => {
-            const botMember = g.members?.me || (g.members?.fetchMe ? await g.members.fetchMe().catch(() => null) : null);
+            const botMember = g.members?.me || cachedBotMember;
             const botHighest = botMember?.roles?.highest;
 
             if (botHighest && targetRole.position !== undefined && botHighest.position !== undefined && targetRole.position >= botHighest.position) {

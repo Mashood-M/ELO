@@ -2,21 +2,22 @@ const { Events } = require('discord.js');
 const config = require('../config');
 const api = require('../lib/api');
 const { ensureLinkChannel } = require('../lib/accountLinking');
+const { handleUserLinked } = require('../lib/clusterSync');
 
 module.exports = {
   name: Events.GuildMemberAdd,
   async execute(member) {
     try {
       const guild = member.guild;
-      let guildConfig = null;
-      try {
-        guildConfig = await api.getGuildConfig(guild.id);
-      } catch (err) {
-        console.error('[guildMemberAdd] Failed to fetch guild config:', err.message);
-      }
 
-      // Check if user is ALREADY linked to ElevatesOS identity
-      const identity = await api.getIdentityByDiscordId(member.id);
+      // Parallelize fetching guild configuration and member's ElevatesOS identity
+      const [guildConfig, identity] = await Promise.all([
+        api.getGuildConfig(guild.id).catch((err) => {
+          console.error('[guildMemberAdd] Failed to fetch guild config:', err.message);
+          return null;
+        }),
+        api.getIdentityByDiscordId(member.id).catch(() => null),
+      ]);
 
       if (identity && identity.profile) {
         console.log(`[guildMemberAdd] Member ${member.user.tag} is already linked as ${identity.name}. Syncing roles immediately.`);
@@ -25,7 +26,6 @@ module.exports = {
 
         // Also assign any cluster member roles immediately!
         try {
-          const { handleUserLinked } = require('../lib/clusterSync');
           await handleUserLinked(member.client, {
             discord_user_id: member.id,
             os_user_id: identity.profile.id,
